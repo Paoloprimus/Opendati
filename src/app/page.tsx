@@ -1,4 +1,4 @@
-import { ChatInput } from '@/components/ChatInput'
+import { ChatInput } from '@/components'
 
 export default function Home() {
   return (
