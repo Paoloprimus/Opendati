@@ -10,8 +10,8 @@
   },
   "dependencies": {
     "next": "14.0.0",
-    "react": "18.0.0",
-    "react-dom": "18.0.0",
+    "react": "18.2.0",  // ⬅️ CAMBIATO DA 18.0.0 a 18.2.0
+    "react-dom": "18.2.0", // ⬅️ STESSA VERSIONE
     "@supabase/supabase-js": "^2.38.0",
     "lucide-react": "^0.294.0"
   },
