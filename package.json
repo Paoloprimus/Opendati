@@ -1,17 +1,17 @@
 {
   "name": "opendati",
-  "version": "0.1.0", 
+  "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build", 
+    "build": "next build",
     "start": "next start",
     "lint": "next lint"
   },
   "dependencies": {
     "next": "14.0.0",
-    "react": "18.2.0",  // ⬅️ CAMBIATO DA 18.0.0 a 18.2.0
-    "react-dom": "18.2.0", // ⬅️ STESSA VERSIONE
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
     "@supabase/supabase-js": "^2.38.0",
     "lucide-react": "^0.294.0"
   },
