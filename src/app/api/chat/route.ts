@@ -2,11 +2,13 @@ import { NextRequest, NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 
 export async function POST(request: NextRequest) {
+  let query: any = null
+  
   try {
     const { question, userId = null } = await request.json()
 
     // 1. Salva query nel database
-    const { data: query, error } = await supabase
+    const { data: queryData, error } = await supabase
       .from('queries')
       .insert({
         user_id: userId,
@@ -17,6 +19,7 @@ export async function POST(request: NextRequest) {
       .single()
 
     if (error) throw error
+    query = queryData
 
     // 2. Cerca dataset reali su opendata.gov.it
     let realDatasets: any[] = []
@@ -173,16 +176,18 @@ export async function POST(request: NextRequest) {
     console.error('Chat API error:', error)
     
     // Salva errore nel database
-    try {
-      await supabase
-        .from('queries')
-        .update({
-          status: 'failed',
-          response: { error: 'Errore di elaborazione' }
-        })
-        .eq('id', query?.id)
-    } catch (dbError) {
-      console.error('Errore salvataggio fallimento:', dbError)
+    if (query) {
+      try {
+        await supabase
+          .from('queries')
+          .update({
+            status: 'failed',
+            response: { error: 'Errore di elaborazione' }
+          })
+          .eq('id', query.id)
+      } catch (dbError) {
+        console.error('Errore salvataggio fallimento:', dbError)
+      }
     }
 
     return NextResponse.json(
