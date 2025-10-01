@@ -1,3 +1,5 @@
+import { ChatInput } from '@/components/ChatInput'
+
 export default function Home() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
@@ -15,8 +17,13 @@ export default function Home() {
               <p className="text-gray-500 mb-4">
                 Chiedimi qualsiasi cosa sui dati italiani...
               </p>
-              <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-gray-400">
-                Input chat (coming soon)
+              
+              <ChatInput />
+              
+              <div className="mt-6 text-sm text-gray-400">
+                <p>Esempi:</p>
+                <p>"Confronta la spesa turistica di Venezia e Roma"</p>
+                <p>"Mostrami l'andamento dei reati a Milano ultimi 5 anni"</p>
               </div>
             </div>
           </div>
