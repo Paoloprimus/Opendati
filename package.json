@@ -13,7 +13,8 @@
     "react": "18.2.0",
     "react-dom": "18.2.0",
     "@supabase/supabase-js": "^2.38.0",
-    "lucide-react": "^0.294.0"
+    "lucide-react": "^0.294.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "tailwindcss": "^3.3.0",
