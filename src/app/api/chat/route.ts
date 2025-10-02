@@ -267,21 +267,43 @@ export async function POST(request: NextRequest) {
             if (!expect) continue
 
             log('resource:fetchSample', { fmt: expect, url })
-            const sample = await fetchSampleData(url, expect)
-            log('resource:sample', { rows: sample.rows.length, note: sample.note })
-            if (sample.rows && sample.rows.length) {
-              // Filtro euristico: città + anni >= startYear (se presenti nei record)
-              const filtered = sample.rows.filter((row: any) => {
-                const s = JSON.stringify(row).toLowerCase()
-                const cityOk = city ? s.includes(city.toLowerCase()) : true
-                const yearMatch = s.match(/\b(20\d{2}|19\d{2})\b/)
-                const yOk = yearMatch ? parseInt(yearMatch[0], 10) >= years.startYear : true
-                return cityOk && yOk
-              })
-              realData = (filtered.length ? filtered : sample.rows).slice(0, 20)
-              log('resource:keptRows', { rows: realData.length })
-              break outer
-            }
+const sample = await fetchSampleData(url, expect)
+if (sample.rows && sample.rows.length) {
+  // helper: almeno un anno nel range
+  const hasYearInRange = (rows: any[]) =>
+    rows.some(r => {
+      const m = JSON.stringify(r).match(/\b(20\d{2}|19\d{2})\b/)
+      return m ? parseInt(m[0], 10) >= years.startYear : false
+    })
+
+  // 1) Se l'utente ha indicato la città, richiedi MATCH OBBLIGATORIO sulla città
+  if (city) {
+    const filtered = sample.rows.filter((row: any) =>
+      JSON.stringify(row).toLowerCase().includes(city.toLowerCase())
+    )
+    if (filtered.length === 0) {
+      log('resource:skipIrrelevant', { reason: 'no-city-match', city, url })
+      continue // prova un’altra risorsa/dataset
+    }
+    if (!hasYearInRange(filtered)) {
+      log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
+      continue
+    }
+    realData = filtered.slice(0, 20)
+    log('resource:keptRows', { rows: realData.length, reason: 'city+year matched' })
+    break outer
+  }
+
+  // 2) Se NON c’è città, richiedi almeno un anno nel range
+  if (!hasYearInRange(sample.rows)) {
+    log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
+    continue
+  }
+  realData = sample.rows.slice(0, 20)
+  log('resource:keptRows', { rows: realData.length, reason: 'year matched' })
+  break outer
+}
+
           }
         }
       } else {
