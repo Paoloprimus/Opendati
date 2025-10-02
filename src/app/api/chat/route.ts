@@ -2,12 +2,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 
-export const runtime = 'nodejs'         // Necessario per Buffer/HEAD su Vercel
-export const dynamic = 'force-dynamic'  // Evita staticizzazione: esegue ad ogni richiesta
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 type CKANDataset = {
   title: string
-  organization?: { title?: string }
+  organization?: { title?: string, name?: string }
   holder_name?: string
   resources?: Array<{
     url?: string
@@ -17,18 +17,13 @@ type CKANDataset = {
   }>
 }
 
-const UA = 'Opendati.it/1.3'
+const UA = 'Opendati.it/1.4'
 
-// ------------------------------
-// Helpers logging
-// ------------------------------
-function log(...args: any[]) { console.log('[CHAT]', ...args) }
-function logErr(...args: any[]) { console.error('[CHAT][ERR]', ...args) }
+// ---------- logging helpers ----------
+const log = (...a: any[]) => console.log('[CHAT]', ...a)
+const logErr = (...a: any[]) => console.error('[CHAT][ERR]', ...a)
 
-// ------------------------------
-// Helpers: estrazione keyword
-// ------------------------------
-// Rimuove gli accenti in modo compatibile (senza \p{Diacritic})
+// ---------- keyword helpers ----------
 function stripAccent(s: string) {
   return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
 }
@@ -36,75 +31,120 @@ function stripAccent(s: string) {
 function extractKeywords(question: string) {
   const q = question.toLowerCase()
   const baseSyn = ['reati', 'delitti', 'criminalità', 'crimini', 'reati denunciati']
-  // aggiungi versione senza accento
-  const topics = Array.from(new Set([
-    ...baseSyn,
-    ...baseSyn.map(s => stripAccent(s))
-  ]))
+  const topics = Array.from(new Set([...baseSyn, ...baseSyn.map(stripAccent)]))
   const city = /\bmilano\b/.test(q) ? 'Milano' : null
 
-  // Ultimi 5 anni: [Y-4 .. Y]
   const now = new Date()
   const endYear = now.getUTCFullYear()
   const startYear = endYear - 4
 
-  return {
-    city,
-    topics,
-    years: { startYear, endYear }
-  }
+  return { city, topics, years: { startYear, endYear } }
 }
 
-// Costruisce URL CKAN con faceted query opzionali (fq) e sort
+// ---------- CKAN URL builders ----------
 function buildCKANUrl(q: string, rows = 50, fq: string[] = [], sort = 'metadata_modified desc') {
-  const base = 'https://www.dati.gov.it/opendata/api/3/action/package_search'
+  const base = 'https://www.dati.gov.it/api/3/action/package_search'
   const fqParam = fq.map(f => `&fq=${encodeURIComponent(f)}`).join('')
   const sortParam = sort ? `&sort=${encodeURIComponent(sort)}` : ''
   return `${base}?q=${encodeURIComponent(q)}&rows=${rows}${fqParam}${sortParam}`
 }
 
-// Genera varianti di ricerca: strict/loose × con/senza città × fq nazionali
-function buildSearchUrls(topics: string[], city: string | null) {
-  const multi = topics.filter(t => t.includes(' '))
-  const single = topics.filter(t => !t.includes(' '))
+// Usa facet per scoprire quali campi/valori sono realmente disponibili
+async function discoverFacets(sampleQ: string) {
+  // ripetiamo facet.field più volte (compatibile CKAN)
+  const base = 'https://www.dati.gov.it/api/3/action/package_search'
+  const fields = ['organization', 'holder_name', 'publisher_name', 'tags', 'res_format']
+  const facetParams = fields.map(f => `facet.field=${encodeURIComponent(f)}`).join('&')
+  const url = `${base}?q=${encodeURIComponent(sampleQ)}&rows=0&${facetParams}&facet.limit=200`
+  log('discover:facetURL', url)
 
-  // STRICT: parole tra virgolette (più preciso ma rischia 0)
-  const strictQ = [
-    ...single.map(s => `"${s}"`),
-    ...multi.map(m => `"${m}"`)
-  ].join(' OR ')
-
-  // LOOSE: senza virgolette per le singole (frasi restano quotate)
-  const looseQ = [
-    ...single,
-    ...multi.map(m => `"${m}"`)
-  ].join(' OR ')
-
-  const cityBitStrict = city ? ` "${city}"` : ''
-  const cityBitLoose  = city ? ` ${city}`   : ''
-
-  const qs = [
-    { label: 'strict+city',   q: `${strictQ}${cityBitStrict}`, fq: [] as string[] },
-    { label: 'loose+city',    q: `${looseQ}${cityBitLoose}`,   fq: [] as string[] },
-    { label: 'strict',        q: `${strictQ}`,                 fq: [] as string[] },
-    { label: 'loose',         q: `${looseQ}`,                  fq: [] as string[] },
-    { label: 'loose+ISTAT',   q: `${looseQ}${cityBitLoose}`,   fq: [`holder_name:"ISTAT"`] },
-    { label: 'loose+Interno', q: `${looseQ}${cityBitLoose}`,   fq: [`holder_name:"Ministero dell'Interno"`] },
-  ]
-
-  return qs.map(v => ({
-    label: v.label,
-    url: buildCKANUrl(v.q, 50, v.fq),
-  }))
+  try {
+    const resp = await fetch(url, { headers: { 'User-Agent': UA }, cache: 'no-store' as const })
+    if (!resp.ok) { log('discover:httpNotOk', resp.status); return null }
+    const json = await resp.json()
+    const facets = json?.result?.facets || {}
+    log('discover:facetsKeys', Object.keys(facets))
+    return facets as Record<string, { items: Array<{ name: string, count: number }> }>
+  } catch (e) {
+    logErr('discover:exception', e)
+    return null
+  }
 }
 
-// Preferisci risorse JSON > CSV; scarta altri formati
+// Costruisce varianti dinamiche in base ai facet reali
+function buildVariants(topics: string[], city: string | null, facets: any) {
+  const multi = topics.filter(t => t.includes(' '))
+  const single = topics.filter(t => !t.includes(' '))
+  const strictQ = [...single.map(s => `"${s}"`), ...multi.map(m => `"${m}"`)].join(' OR ')
+  const looseQ  = [...single, ...multi.map(m => `"${m}"`)].join(' OR ')
+  const cityStrict = city ? ` "${city}"` : ''
+  const cityLoose  = city ? ` ${city}`   : ''
+
+  const variants: Array<{ label: string, url: string }> = []
+
+  // Base (senza fq)
+  variants.push({ label: 'strict+city', url: buildCKANUrl(`${strictQ}${cityStrict}`, 50) })
+  variants.push({ label: 'loose+city',  url: buildCKANUrl(`${looseQ}${cityLoose}`, 50) })
+  variants.push({ label: 'strict',      url: buildCKANUrl(strictQ, 50) })
+  variants.push({ label: 'loose',       url: buildCKANUrl(looseQ, 50) })
+
+  // Se il portale indicizza queste facet, aggiungiamo fq mirati
+  const facetHas = (k: string) => facets && facets[k] && Array.isArray(facets[k].items)
+
+  // Trova valori utili dalle facet (slug o label)
+  const pickFacetValue = (key: string, includes: string[]) => {
+    if (!facetHas(key)) return null
+    const items = facets[key].items as Array<{ name: string, count: number }>
+    const hit = items.find(it => includes.some(s => it.name.toLowerCase().includes(s)))
+    return hit?.name || null
+  }
+
+  // organization (slug) per ISTAT / Interno / Milano
+  const orgIstat   = pickFacetValue('organization', ['istat'])
+  const orgInterno = pickFacetValue('organization', ['interno'])
+  const orgMilano  = pickFacetValue('organization', ['milano'])
+
+  // holder_name (label) per robustezza
+  const holdIstat   = pickFacetValue('holder_name', ['istat'])
+  const holdInterno = pickFacetValue('holder_name', ['interno'])
+  const holdMilano  = pickFacetValue('holder_name', ['milano', 'comune di milano'])
+
+  // Publisher (alcuni portali usano questo)
+  const pubMilano = pickFacetValue('publisher_name', ['milano'])
+
+  // Res format preferiti
+  const hasCSV  = pickFacetValue('res_format', ['csv'])
+  const hasJSON = pickFacetValue('res_format', ['json'])
+
+  // Costruisci varianti fq in ordine di confidenza
+  const addFQ = (label: string, q: string, fq: string[]) =>
+    variants.push({ label, url: buildCKANUrl(q, 50, fq) })
+
+  if (orgMilano)   addFQ('loose+org:milano', `${looseQ}${cityLoose}`, [`organization:${orgMilano}`])
+  if (holdMilano)  addFQ('loose+holder:milano', `${looseQ}${cityLoose}`, [`holder_name:"${holdMilano}"`])
+  if (pubMilano)   addFQ('loose+publisher:milano', `${looseQ}${cityLoose}`, [`publisher_name:"${pubMilano}"`])
+
+  if (orgIstat)    addFQ('loose+org:istat', `${looseQ}${cityLoose}`, [`organization:${orgIstat}`])
+  else if (holdIstat) addFQ('loose+holder:istat', `${looseQ}${cityLoose}`, [`holder_name:"${holdIstat}"`])
+
+  if (orgInterno)  addFQ('loose+org:interno', `${looseQ}${cityLoose}`, [`organization:${orgInterno}`])
+  else if (holdInterno) addFQ('loose+holder:interno', `${looseQ}${cityLoose}`, [`holder_name:"${holdInterno}"`])
+
+  // Se il portale ci dice che JSON/CSV sono presenti, proviamo un bias sul formato
+  if (hasJSON) addFQ('loose+format:json', `${looseQ}${cityLoose}`, [`res_format:JSON`])
+  if (hasCSV)  addFQ('loose+format:csv',  `${looseQ}${cityLoose}`, [`res_format:CSV`])
+
+  return variants
+}
+
+// ---------- resource helpers ----------
 function pickBestResources(ds: CKANDataset) {
   const res = ds.resources || []
   const score = (r: any) => {
     const fmt = (r.format || r.mimetype || '').toString().toLowerCase()
-    if (fmt.includes('json') || fmt === 'json') return 3
-    if (fmt.includes('csv') || fmt === 'csv' || r.url?.toLowerCase().endsWith('.csv')) return 2
+    const url = (r.url || '').toLowerCase()
+    if (fmt.includes('json') || url.endsWith('.json')) return 3
+    if (fmt.includes('csv') || url.endsWith('.csv'))  return 2
     return 0
   }
   return res
@@ -124,7 +164,7 @@ async function headInfo(url: string) {
   }
 }
 
-// CSV: autodetect delimitatore (',' ';' '\t')
+// autodetect delimitatore CSV
 function splitCSVLine(line: string, headerLine: string) {
   const counts = {
     ',': (headerLine.match(/,/g) || []).length,
@@ -135,7 +175,6 @@ function splitCSVLine(line: string, headerLine: string) {
   return line.split(delim)
 }
 
-// Scarica un campione JSON/CSV (limite 1 MB)
 async function fetchSampleData(url: string, expect: 'json'|'csv', maxBytes = 1_000_000) {
   const h = await headInfo(url)
   if (h.ok && h.contentLength && h.contentLength > maxBytes) {
@@ -159,7 +198,7 @@ async function fetchSampleData(url: string, expect: 'json'|'csv', maxBytes = 1_0
     }
   }
 
-  // CSV con autodetect delimitatore
+  // CSV
   const lines = text.split(/\r?\n/).filter(Boolean).slice(0, 101)
   if (lines.length < 2) return { rows: [], note: 'csv_too_short' }
   const headers = splitCSVLine(lines[0], lines[0]).map(h => h.trim())
@@ -172,9 +211,7 @@ async function fetchSampleData(url: string, expect: 'json'|'csv', maxBytes = 1_0
   return { rows: rows.slice(0, 20), note: 'csv_sample' }
 }
 
-// ------------------------------
-// Handler principale
-// ------------------------------
+// ---------- handler ----------
 export async function POST(request: NextRequest) {
   let query: any = null
 
@@ -183,7 +220,7 @@ export async function POST(request: NextRequest) {
     const { question, userId = null } = await request.json()
     log('request:payload', { hasUserId: !!userId, qLen: (question || '').length })
 
-    // 1) Logga la query
+    // 1) Log DB
     const { data: queryData, error } = await supabase
       .from('queries')
       .insert({ user_id: userId, question, status: 'processing' })
@@ -193,26 +230,31 @@ export async function POST(request: NextRequest) {
     query = queryData
     log('db:inserted', { queryId: query.id })
 
-    // 2) Ricerca dataset reali su dati.gov.it (keyword migliorate + varianti)
+    // 2) Keywords
     const { topics, city, years } = extractKeywords(question)
     log('extractKeywords', { city, topicsCount: topics.length, years })
+
+    // 3) Discovery facet → varianti dinamiche
+    const discoveryQ = city ? `${topics.join(' ')} ${city}` : topics.join(' ')
+    const facets = await discoverFacets(discoveryQ)
+    const variants = buildVariants(topics, city, facets)
+    log('search:variantsCount', variants.length)
+
     let realDatasets: CKANDataset[] = []
     let realData: any[] = []
 
+    // 4) Ricerche in sequenza
     try {
-      const variants = buildSearchUrls(topics, city)
-      log('search:variants', { count: variants.length })
-
       let results: CKANDataset[] = []
 
       for (const v of variants) {
-        log('search:try', v.url)
+        log('search:try', v.label, v.url)
         const dsResp = await fetch(v.url, { headers: { 'User-Agent': UA }, cache: 'no-store' as const })
         if (!dsResp.ok) { log('search:httpNotOk', dsResp.status); continue }
         const json = await dsResp.json()
         const count = json?.result?.count ?? 0
         results = json?.result?.results || []
-        log('search:count', { count, results: results.length })
+        log('search:count', { label: v.label, count, results: results.length })
         if (count > 0 && results.length > 0) break
       }
 
@@ -220,26 +262,23 @@ export async function POST(request: NextRequest) {
         realDatasets = results.slice(0, 6)
         log('datasets:selected', { n: realDatasets.length })
 
-        // Prova più dataset/risorse finché trovi righe campionabili (JSON/CSV)
+        // 5) Cerca una risorsa leggibile (JSON/CSV) e campiona
         outer:
         for (const ds of realDatasets) {
           const candidates = pickBestResources(ds)
           log('resources:candidates', { title: ds.title, n: candidates.length })
           for (const r of candidates) {
             const url = r.url as string
-            const fmt = (r.format || r.mimetype || url).toString().toLowerCase()
-
-            const expect: 'json'|'csv' | null =
-              fmt.includes('json') || url.toLowerCase().endsWith('.json') ? 'json'
-              : (fmt.includes('csv') || url.toLowerCase().endsWith('.csv')) ? 'csv'
-              : null
+            const low = (r.format || r.mimetype || url).toString().toLowerCase()
+            const expect: 'json'|'csv'|null =
+              low.includes('json') || url.endsWith('.json') ? 'json' :
+              (low.includes('csv') || url.endsWith('.csv')) ? 'csv' : null
             if (!expect) continue
 
             log('resource:fetchSample', { fmt: expect, url })
             const sample = await fetchSampleData(url, expect)
             log('resource:sample', { rows: sample.rows.length, note: sample.note })
             if (sample.rows && sample.rows.length) {
-              // Filtro euristico: città + anni recenti
               const filtered = sample.rows.filter((row: any) => {
                 const s = JSON.stringify(row).toLowerCase()
                 const cityOk = city ? s.includes(city.toLowerCase()) : true
@@ -260,7 +299,7 @@ export async function POST(request: NextRequest) {
       logErr('search:exception', e)
     }
 
-    // 3) Se NON ho dati reali → niente OpenAI, niente esempi
+    // 6) Nessun dato reale → messaggio secco
     if (realData.length === 0) {
       const responsePayload = {
         answer: 'Per ora non riesco a scovare dati utili, scusa.',
@@ -268,7 +307,7 @@ export async function POST(request: NextRequest) {
         sources: [],
         realDatasets: realDatasets.map(ds => ({
           title: ds.title,
-          source: ds.organization?.title || ds.holder_name,
+          source: ds.organization?.title || ds.holder_name || ds.organization?.name,
           resources: ds.resources?.length || 0
         })),
         hasRealData: false
@@ -280,7 +319,7 @@ export async function POST(request: NextRequest) {
           response: responsePayload,
           sources: responsePayload.sources,
           data_points: 0,
-          status: 'completed' // completed ma senza dati
+          status: 'completed'
         })
         .eq('id', query.id)
 
@@ -288,7 +327,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ ...responsePayload, queryId: query.id })
     }
 
-    // 4) Se ho dati reali → usa OpenAI per analisi (NLP sui dati reali)
+    // 7) Dati reali → analisi con OpenAI
     const systemPrompt = `Sei un assistente che analizza dati pubblici italiani REALI.
 Ecco un campione (max 20 righe) estratto da risorse open data:
 ${JSON.stringify(realData, null, 2)}
@@ -319,35 +358,24 @@ Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
       cache: 'no-store' as const
     })
 
-    if (!openaiResponse.ok) {
-      throw new Error(`OpenAI API error: ${openaiResponse.status}`)
-    }
-
+    if (!openaiResponse.ok) throw new Error(`OpenAI API error: ${openaiResponse.status}`)
     const openaiData = await openaiResponse.json()
     const content = openaiData.choices[0].message.content
 
-    // 5) Parsing JSON dall'output LLM
     let parsedResponse: any
-    try {
-      parsedResponse = JSON.parse(content)
-    } catch {
-      parsedResponse = {
-        answer: content,
-        data: [],
-        sources: ['opendata.gov.it']
-      }
+    try { parsedResponse = JSON.parse(content) }
+    catch {
+      parsedResponse = { answer: content, data: [], sources: ['opendata.gov.it'] }
     }
 
-    // 6) Info dataset reali usati
     if (realDatasets.length > 0) {
       parsedResponse.realDatasets = realDatasets.map(ds => ({
         title: ds.title,
-        source: ds.organization?.title || ds.holder_name,
+        source: ds.organization?.title || ds.holder_name || ds.organization?.name,
         resources: ds.resources?.length || 0
       }))
     }
 
-    // 7) Persisti e rispondi
     await supabase
       .from('queries')
       .update({
@@ -359,34 +387,20 @@ Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
       .eq('id', query.id)
 
     log('response:ok', { queryId: query.id, dataPoints: parsedResponse.data?.length || 0 })
-    return NextResponse.json({
-      ...parsedResponse,
-      queryId: query.id,
-      hasRealData: true
-    })
+    return NextResponse.json({ ...parsedResponse, queryId: query.id, hasRealData: true })
 
   } catch (error) {
     logErr('handler:exception', error)
     if (query) {
       try {
-        await supabase
-          .from('queries')
-          .update({
-            status: 'failed',
-            response: { error: 'Errore di elaborazione' }
-          })
+        await supabase.from('queries')
+          .update({ status: 'failed', response: { error: 'Errore di elaborazione' } })
           .eq('id', query.id)
-      } catch (dbError) {
-        logErr('handler:storeFail', dbError)
-      }
+      } catch (dbError) { logErr('handler:storeFail', dbError) }
     }
     return NextResponse.json(
-      {
-        error: 'Errore nell\'elaborazione della richiesta',
-        answer: 'Per ora non riesco a scovare dati utili, scusa.',
-        data: [],
-        sources: []
-      },
+      { error: 'Errore nell\'elaborazione della richiesta',
+        answer: 'Per ora non riesco a scovare dati utili, scusa.', data: [], sources: [] },
       { status: 500 }
     )
   }
