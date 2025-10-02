@@ -11,10 +11,16 @@ export const dynamic = 'force-dynamic'
 /** CKAN base (quella che nel debug ha dato risultati) */
 const CKAN_BASE = 'https://www.dati.gov.it/opendata/api/3/action'
 
+type CKANTag = { name?: string; display_name?: string }
+type CKANGroup = { name?: string; title?: string }
+
 type CKANDataset = {
   title: string
+  notes?: string
   organization?: { title?: string; name?: string }
   holder_name?: string
+  groups?: CKANGroup[]
+  tags?: CKANTag[]
   resources?: Array<{
     url?: string
     format?: string
@@ -23,7 +29,7 @@ type CKANDataset = {
   }>
 }
 
-const UA = 'Opendati.it/1.5'
+const UA = 'Opendati.it/1.6'
 
 // ------------------------------
 // Logging helpers
@@ -54,7 +60,10 @@ function extractKeywords(question: string) {
     'reati',
     'criminalità',
     'criminalita',
-    'crimini'
+    'crimini',
+    'sicurezza',
+    'ordine pubblico',
+    'giustizia'
   ]
   const topics = Array.from(new Set([...baseSyn, ...baseSyn.map(stripAccent)]))
 
@@ -122,6 +131,69 @@ function buildSearchVariants(topics: string[], city: string | null) {
   }
 
   return variants
+}
+
+// ------------------------------
+// Broad fallback su "Milano" (scansione mirata)
+// ------------------------------
+/**
+ * Assegna un punteggio "affinità crimine/sicurezza" al dataset guardando titolo, note, tag, gruppi e ente
+ */
+function scoreDatasetForCrime(ds: CKANDataset): number {
+  const text = `${ds.title || ''} ${ds.notes || ''}`.toLowerCase()
+  const tags = (ds.tags || []).map(t => (t.display_name || t.name || '').toLowerCase())
+  const groups = (ds.groups || []).map(g => (g.title || g.name || '').toLowerCase())
+  const org = `${ds.organization?.title || ''} ${ds.holder_name || ''} ${ds.organization?.name || ''}`.toLowerCase()
+
+  let score = 0
+  const bump = (n: number) => (score += n)
+
+  // parole chiave forti
+  const strong = ['delitti denunciati', 'reati denunciati', 'reati', 'delitti', 'criminalità', 'criminalita', 'crimini']
+  const medium = ['sicurezza', 'ordine pubblico', 'giustizia', 'polizia', 'carabinieri']
+
+  if (strong.some(k => text.includes(k))) bump(6)
+  if (medium.some(k => text.includes(k))) bump(3)
+
+  // tag/gruppi
+  if (tags.some(t => strong.includes(t))) bump(4)
+  if (tags.some(t => medium.includes(t))) bump(2)
+  if (groups.some(g => strong.includes(g))) bump(4)
+  if (groups.some(g => medium.includes(g))) bump(2)
+
+  // ente
+  if (org.includes('interno')) bump(3)
+  if (org.includes('istat')) bump(2)
+  if (org.includes('comune di milano') || org.includes('comune-milano') || org.includes('comune-milano')) bump(2)
+
+  // risorse utili
+  const resources = ds.resources || []
+  const hasJSON = resources.some(r => (r.format || r.mimetype || '').toLowerCase().includes('json') || (r.url || '').toLowerCase().endsWith('.json'))
+  const hasCSV  = resources.some(r => (r.format || r.mimetype || '').toLowerCase().includes('csv')  || (r.url || '').toLowerCase().endsWith('.csv'))
+  if (hasJSON) bump(2)
+  if (hasCSV)  bump(2)
+
+  return score
+}
+
+async function broadMilanoCandidates(rows = 100) {
+  const url = buildCKANUrl('Milano', rows)
+  log('broad:try', url)
+  const r = await fetch(url, { headers: { 'User-Agent': UA }, cache: 'no-store' as const })
+  if (!r.ok) {
+    log('broad:httpNotOk', r.status)
+    return []
+  }
+  const j = await r.json()
+  const results: CKANDataset[] = j?.result?.results || []
+  // ordina per punteggio desc
+  const ranked = results
+    .map(ds => ({ ds, score: scoreDatasetForCrime(ds) }))
+    .sort((a, b) => b.score - a.score)
+
+  log('broad:rankTop', ranked.slice(0, 5).map(x => ({ title: x.ds.title, score: x.score })))
+  // tieni i migliori 12 per non esagerare con fetch
+  return ranked.filter(x => x.score > 0).slice(0, 12).map(x => x.ds)
 }
 
 // ------------------------------
@@ -235,6 +307,7 @@ export async function POST(request: NextRequest) {
     try {
       let results: CKANDataset[] = []
 
+      // 2.a) Varianti mirate
       for (const v of variants) {
         log('search:try', v.label, v.url)
         const dsResp = await fetch(v.url, { headers: { 'User-Agent': UA }, cache: 'no-store' as const })
@@ -249,11 +322,23 @@ export async function POST(request: NextRequest) {
         if (count > 0 && results.length > 0) break
       }
 
+      // 2.b) Fallback ampio su "Milano" con ranking per tema crimini/sicurezza
+      if (!results || results.length === 0) {
+        const broad = await broadMilanoCandidates(100)
+        if (broad.length > 0) {
+          results = broad
+          log('broad:useCandidates', results.length)
+        } else {
+          log('broad:noCandidates')
+        }
+      }
+
       if (results.length > 0) {
-        realDatasets = results.slice(0, 6)
+        // Se i risultati vengono da ricerca standard, limitiamoci ai primi 6; se da broad, sono già top rank.
+        realDatasets = results.slice(0, 12)
         log('datasets:selected', { n: realDatasets.length })
 
-        // 3) Campiona una risorsa JSON/CSV
+        // 3) Campiona una risorsa JSON/CSV e filtra per città+anni
         outer: for (const ds of realDatasets) {
           const candidates = pickBestResources(ds)
           log('resources:candidates', { title: ds.title, n: candidates.length })
@@ -267,43 +352,43 @@ export async function POST(request: NextRequest) {
             if (!expect) continue
 
             log('resource:fetchSample', { fmt: expect, url })
-const sample = await fetchSampleData(url, expect)
-if (sample.rows && sample.rows.length) {
-  // helper: almeno un anno nel range
-  const hasYearInRange = (rows: any[]) =>
-    rows.some(r => {
-      const m = JSON.stringify(r).match(/\b(20\d{2}|19\d{2})\b/)
-      return m ? parseInt(m[0], 10) >= years.startYear : false
-    })
+            const sample = await fetchSampleData(url, expect)
+            log('resource:sample', { rows: sample.rows.length, note: sample.note })
+            if (sample.rows && sample.rows.length) {
+              // helper: almeno un anno nel range
+              const hasYearInRange = (rows: any[]) =>
+                rows.some(r => {
+                  const m = JSON.stringify(r).match(/\b(20\d{2}|19\d{2})\b/)
+                  return m ? parseInt(m[0], 10) >= years.startYear : false
+                })
 
-  // 1) Se l'utente ha indicato la città, richiedi MATCH OBBLIGATORIO sulla città
-  if (city) {
-    const filtered = sample.rows.filter((row: any) =>
-      JSON.stringify(row).toLowerCase().includes(city.toLowerCase())
-    )
-    if (filtered.length === 0) {
-      log('resource:skipIrrelevant', { reason: 'no-city-match', city, url })
-      continue // prova un’altra risorsa/dataset
-    }
-    if (!hasYearInRange(filtered)) {
-      log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
-      continue
-    }
-    realData = filtered.slice(0, 20)
-    log('resource:keptRows', { rows: realData.length, reason: 'city+year matched' })
-    break outer
-  }
+              // 1) Se l'utente ha indicato la città, richiedi MATCH OBBLIGATORIO sulla città
+              if (city) {
+                const filtered = sample.rows.filter((row: any) =>
+                  JSON.stringify(row).toLowerCase().includes(city.toLowerCase())
+                )
+                if (filtered.length === 0) {
+                  log('resource:skipIrrelevant', { reason: 'no-city-match', city, url })
+                  continue // prova un’altra risorsa/dataset
+                }
+                if (!hasYearInRange(filtered)) {
+                  log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
+                  continue
+                }
+                realData = filtered.slice(0, 20)
+                log('resource:keptRows', { rows: realData.length, reason: 'city+year matched' })
+                break outer
+              }
 
-  // 2) Se NON c’è città, richiedi almeno un anno nel range
-  if (!hasYearInRange(sample.rows)) {
-    log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
-    continue
-  }
-  realData = sample.rows.slice(0, 20)
-  log('resource:keptRows', { rows: realData.length, reason: 'year matched' })
-  break outer
-}
-
+              // 2) Se NON c’è città, richiedi almeno un anno nel range
+              if (!hasYearInRange(sample.rows)) {
+                log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
+                continue
+              }
+              realData = sample.rows.slice(0, 20)
+              log('resource:keptRows', { rows: realData.length, reason: 'year matched' })
+              break outer
+            }
           }
         }
       } else {
