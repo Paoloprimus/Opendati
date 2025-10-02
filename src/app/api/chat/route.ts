@@ -329,59 +329,94 @@ export async function POST(request: NextRequest) {
         realDatasets = results.slice(0, 12)
         log('datasets:selected', { n: realDatasets.length })
 
-        outer: for (const ds of realDatasets) {
-          const candidates = pickBestResources(ds)
-          log('resources:candidates', { title: ds.title, n: candidates.length })
-          for (const r of candidates) {
-            const url = r.url as string
-            const low = (r.format || r.mimetype || url).toString().toLowerCase()
-            const expect: 'json' | 'csv' | null =
-              low.includes('json') || url.endsWith('.json') ? 'json'
-              : low.includes('csv') || url.endsWith('.csv') ? 'csv'
-              : null
-            if (!expect) continue
+outer: for (const ds of realDatasets) {
+  const candidates = pickBestResources(ds)
+  log('resources:candidates', { title: ds.title, n: candidates.length })
 
-            log('resource:fetchSample', { fmt: expect, url })
-            const sample = await fetchSampleData(url, expect)
-            log('resource:sample', { rows: sample.rows.length, note: sample.note })
-            if (sample.rows && sample.rows.length) {
-              // helper: almeno un anno nel range
-              const hasYearInRange = (rows: any[]) =>
-                rows.some(r => {
-                  const m = JSON.stringify(r).match(/\b(20\d{2}|19\d{2})\b/)
-                  return m ? parseInt(m[0], 10) >= years.startYear && parseInt(m[0], 10) <= years.endYear : false
-                })
+  // --- Heuristics dataset-level (città/anni) ---
+  const dsText = `${ds.title || ''} ${ds.notes || ''} ${ds.organization?.title || ''} ${ds.holder_name || ''} ${ds.organization?.name || ''}`.toLowerCase()
+  const dsCityOk = city
+    ? (dsText.includes(city.toLowerCase()))
+    : true
 
-              if (city) {
-                const filtered = sample.rows.filter((row: any) =>
-                  JSON.stringify(row).toLowerCase().includes(city.toLowerCase())
-                )
-                if (filtered.length === 0) {
-                  log('resource:skipIrrelevant', { reason: 'no-city-match', city, url })
-                  continue
-                }
-                if (!hasYearInRange(filtered)) {
-                  log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
-                  continue
-                }
-                realData = filtered.slice(0, 20)
-                log('resource:keptRows', { rows: realData.length, reason: 'city+year matched' })
-                break outer
-              }
+  // se qualche resource è del dominio dati.comune.milano.it, consideralo Milano
+  const hasMilanoHost = (ds.resources || []).some(r => {
+    try {
+      const u = new URL(r.url || '')
+      return u.hostname.includes('dati.comune.milano.it')
+    } catch { return false }
+  })
 
-              if (!hasYearInRange(sample.rows)) {
-                log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
-                continue
-              }
-              realData = sample.rows.slice(0, 20)
-              log('resource:keptRows', { rows: realData.length, reason: 'year matched' })
-              break outer
-            }
-          }
-        }
-      } else {
-        log('search:noResults')
+  // estrae anni dal titolo/notes (hint)
+  const dsYears = Array.from(dsText.matchAll(/\b(19|20)\d{2}\b/g)).map(m => parseInt(m[0], 10))
+  const dsMaxYear = dsYears.length ? Math.max(...dsYears) : null
+  const dsYearOk = dsMaxYear !== null ? (dsMaxYear >= years.startYear && dsMaxYear <= years.endYear || dsMaxYear >= years.startYear) : false
+
+  for (const r of candidates) {
+    const url = r.url as string
+    const low = (r.format || r.mimetype || url).toString().toLowerCase()
+    const expect: 'json'|'csv'|null =
+      low.includes('json') || url.endsWith('.json') ? 'json'
+      : low.includes('csv') || url.endsWith('.csv') ? 'csv'
+      : null
+    if (!expect) continue
+
+    log('resource:fetchSample', { fmt: expect, url })
+    const sample = await fetchSampleData(url, expect)
+    log('resource:sample', { rows: sample.rows.length, note: sample.note })
+    if (!(sample.rows && sample.rows.length)) continue
+
+    // helper: almeno un anno nel range nel campione
+    const hasYearInRange = (rows: any[]) =>
+      rows.some(r => {
+        const m = JSON.stringify(r).match(/\b(20\d{2}|19\d{2})\b/)
+        if (!m) return false
+        const y = parseInt(m[0], 10)
+        return y >= years.startYear && y <= years.endYear
+      })
+
+    // ---- Policy di accettazione ----
+    // Se l'utente ha chiesto "Milano":
+    if (city) {
+      // 1) preferisci righe che contengono "milano"
+      const filteredCity = sample.rows.filter((row: any) =>
+        JSON.stringify(row).toLowerCase().includes(city.toLowerCase())
+      )
+      if (filteredCity.length && hasYearInRange(filteredCity)) {
+        realData = filteredCity.slice(0, 20)
+        log('resource:keptRows', { rows: realData.length, reason: 'row city+year matched' })
+        break outer
       }
+
+      // 2) se il dataset è chiaramente di Milano (org o host) accetta il campione
+      //    purché il campione o l'hint dataset-level indichi anni nel range
+      const cityByDataset = dsCityOk || hasMilanoHost
+      if (cityByDataset && (hasYearInRange(sample.rows) || dsYearOk)) {
+        realData = sample.rows.slice(0, 20)
+        log('resource:keptRows', { rows: realData.length, reason: 'dataset-level Milano + year matched (sample or hint)' })
+        break outer
+      }
+
+      log('resource:skipIrrelevant', {
+        reason: 'no-city-match-and/no-year',
+        city,
+        url
+      })
+      continue
+    }
+
+    // Se NON c’è città, richiedi almeno un anno recente nel campione o nell’hint
+    if (hasYearInRange(sample.rows) || dsYearOk) {
+      realData = sample.rows.slice(0, 20)
+      log('resource:keptRows', { rows: realData.length, reason: 'year matched (sample or hint)' })
+      break outer
+    }
+
+    log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
+    continue
+  }
+}
+
 
       // 7) Nessun dato reale pertinente → messaggio secco
       if (realData.length === 0) {
