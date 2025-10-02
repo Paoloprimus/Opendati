@@ -2,7 +2,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 
-export const runtime = 'nodejs' // necessario per Buffer/HEAD su Vercel
+export const runtime = 'nodejs'         // Necessario per Buffer/HEAD su Vercel
+export const dynamic = 'force-dynamic'  // Evita staticizzazione: esegue ad ogni richiesta
 
 type CKANDataset = {
   title: string
@@ -19,7 +20,13 @@ type CKANDataset = {
 const UA = 'Opendati.it/1.3'
 
 // ------------------------------
-//  Helpers: estrazione keyword
+// Helpers logging
+// ------------------------------
+function log(...args: any[]) { console.log('[CHAT]', ...args) }
+function logErr(...args: any[]) { console.error('[CHAT][ERR]', ...args) }
+
+// ------------------------------
+// Helpers: estrazione keyword
 // ------------------------------
 // Rimuove gli accenti in modo compatibile (senza \p{Diacritic})
 function stripAccent(s: string) {
@@ -108,7 +115,7 @@ function pickBestResources(ds: CKANDataset) {
 
 async function headInfo(url: string) {
   try {
-    const resp = await fetch(url, { method: 'HEAD', headers: { 'User-Agent': UA } })
+    const resp = await fetch(url, { method: 'HEAD', headers: { 'User-Agent': UA }, cache: 'no-store' as const })
     const type = resp.headers.get('content-type') || ''
     const len = parseInt(resp.headers.get('content-length') || '0', 10)
     return { ok: resp.ok, contentType: type, contentLength: isNaN(len) ? 0 : len }
@@ -134,7 +141,7 @@ async function fetchSampleData(url: string, expect: 'json'|'csv', maxBytes = 1_0
   if (h.ok && h.contentLength && h.contentLength > maxBytes) {
     return { rows: [], note: 'skipped_large_file' }
   }
-  const resp = await fetch(url, { headers: { 'User-Agent': UA } })
+  const resp = await fetch(url, { headers: { 'User-Agent': UA }, cache: 'no-store' as const })
   if (!resp.ok) return { rows: [], note: 'fetch_failed' }
 
   const buf = Buffer.from(await resp.arrayBuffer())
@@ -166,13 +173,15 @@ async function fetchSampleData(url: string, expect: 'json'|'csv', maxBytes = 1_0
 }
 
 // ------------------------------
-//  Handler principale
+// Handler principale
 // ------------------------------
 export async function POST(request: NextRequest) {
   let query: any = null
 
   try {
+    log('request:start', { ts: new Date().toISOString() })
     const { question, userId = null } = await request.json()
+    log('request:payload', { hasUserId: !!userId, qLen: (question || '').length })
 
     // 1) Logga la query
     const { data: queryData, error } = await supabase
@@ -182,34 +191,40 @@ export async function POST(request: NextRequest) {
       .single()
     if (error) throw error
     query = queryData
+    log('db:inserted', { queryId: query.id })
 
     // 2) Ricerca dataset reali su dati.gov.it (keyword migliorate + varianti)
     const { topics, city, years } = extractKeywords(question)
+    log('extractKeywords', { city, topicsCount: topics.length, years })
     let realDatasets: CKANDataset[] = []
     let realData: any[] = []
 
     try {
       const variants = buildSearchUrls(topics, city)
+      log('search:variants', { count: variants.length })
+
       let results: CKANDataset[] = []
 
       for (const v of variants) {
-        console.log('[CHAT] CKAN search URL:', v.url)
-        const dsResp = await fetch(v.url, { headers: { 'User-Agent': UA } })
-        if (!dsResp.ok) continue
+        log('search:try', v.url)
+        const dsResp = await fetch(v.url, { headers: { 'User-Agent': UA }, cache: 'no-store' as const })
+        if (!dsResp.ok) { log('search:httpNotOk', dsResp.status); continue }
         const json = await dsResp.json()
         const count = json?.result?.count ?? 0
-        console.log('[CHAT] CKAN count:', count, 'label:', v.label)
         results = json?.result?.results || []
+        log('search:count', { count, results: results.length })
         if (count > 0 && results.length > 0) break
       }
 
       if (results.length > 0) {
-        realDatasets = results.slice(0, 6) // allarga un po' il ventaglio
+        realDatasets = results.slice(0, 6)
+        log('datasets:selected', { n: realDatasets.length })
 
         // Prova più dataset/risorse finché trovi righe campionabili (JSON/CSV)
         outer:
         for (const ds of realDatasets) {
           const candidates = pickBestResources(ds)
+          log('resources:candidates', { title: ds.title, n: candidates.length })
           for (const r of candidates) {
             const url = r.url as string
             const fmt = (r.format || r.mimetype || url).toString().toLowerCase()
@@ -220,7 +235,9 @@ export async function POST(request: NextRequest) {
               : null
             if (!expect) continue
 
+            log('resource:fetchSample', { fmt: expect, url })
             const sample = await fetchSampleData(url, expect)
+            log('resource:sample', { rows: sample.rows.length, note: sample.note })
             if (sample.rows && sample.rows.length) {
               // Filtro euristico: città + anni recenti
               const filtered = sample.rows.filter((row: any) => {
@@ -231,13 +248,16 @@ export async function POST(request: NextRequest) {
                 return cityOk && yOk
               })
               realData = (filtered.length ? filtered : sample.rows).slice(0, 20)
+              log('resource:keptRows', { rows: realData.length })
               break outer
             }
           }
         }
+      } else {
+        log('search:noResults')
       }
     } catch (e) {
-      console.log('Ricerca dataset fallita:', e)
+      logErr('search:exception', e)
     }
 
     // 3) Se NON ho dati reali → niente OpenAI, niente esempi
@@ -264,6 +284,7 @@ export async function POST(request: NextRequest) {
         })
         .eq('id', query.id)
 
+      log('response:noRealData', { queryId: query.id })
       return NextResponse.json({ ...responsePayload, queryId: query.id })
     }
 
@@ -294,7 +315,8 @@ Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
         ],
         temperature: 0.2,
         max_tokens: 1500
-      })
+      }),
+      cache: 'no-store' as const
     })
 
     if (!openaiResponse.ok) {
@@ -336,6 +358,7 @@ Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
       })
       .eq('id', query.id)
 
+    log('response:ok', { queryId: query.id, dataPoints: parsedResponse.data?.length || 0 })
     return NextResponse.json({
       ...parsedResponse,
       queryId: query.id,
@@ -343,7 +366,7 @@ Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
     })
 
   } catch (error) {
-    console.error('Chat API error:', error)
+    logErr('handler:exception', error)
     if (query) {
       try {
         await supabase
@@ -354,7 +377,7 @@ Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
           })
           .eq('id', query.id)
       } catch (dbError) {
-        console.error('Errore salvataggio fallimento:', dbError)
+        logErr('handler:storeFail', dbError)
       }
     }
     return NextResponse.json(
