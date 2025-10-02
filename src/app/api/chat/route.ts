@@ -1,6 +1,7 @@
 // src/app/api/chat/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
+import { intelligentQueryPlan } from '@/lib/query/intelligentQuery' // ⬅️ usa LLM per pre-analisi
 
 /**
  * Forziamo runtime Node e risposta dinamica (niente cache di build).
@@ -29,7 +30,7 @@ type CKANDataset = {
   }>
 }
 
-const UA = 'Opendati.it/1.6'
+const UA = 'Opendati.it/1.7'
 
 // ------------------------------
 // Logging helpers
@@ -38,21 +39,15 @@ const log = (...a: any[]) => console.log('[CHAT]', ...a)
 const logErr = (...a: any[]) => console.error('[CHAT][ERR]', ...a)
 
 // ------------------------------
-// Keyword helpers
+// Keyword helpers (fallback locale, se LLM non disponibile)
 // ------------------------------
 function stripAccent(s: string) {
-  // Compatibile anche con target TS < ES2018
   return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
 }
 
-/**
- * Estrae geo/tema/periodo con euristiche snelle (senza LLM).
- * NB: “ultimi 5 anni” = [Y-4..Y]. Gli anni precisi li filtriamo dopo nei record.
- */
-function extractKeywords(question: string) {
+/** euristiche minime locali, usate solo come fallback se l'LLM fallisce */
+function fallbackExtractKeywords(question: string) {
   const q = question.toLowerCase()
-
-  // Termini “secchi” (niente wildcard) + variant senza accento
   const baseSyn = [
     'delitti denunciati',
     'reati denunciati',
@@ -66,19 +61,15 @@ function extractKeywords(question: string) {
     'giustizia'
   ]
   const topics = Array.from(new Set([...baseSyn, ...baseSyn.map(stripAccent)]))
-
   const city = /\bmilano\b/.test(q) ? 'Milano' : null
 
   const now = new Date()
   const endYear = now.getUTCFullYear()
   const startYear = endYear - 4
-
   return { city, topics, years: { startYear, endYear } }
 }
 
-/**
- * Costruisce URL di package_search con eventuali filtri facet (fq)
- */
+/** URL di package_search con eventuali filtri facet (fq) */
 function buildCKANUrl(q: string, rows = 50, fq: string[] = [], sort = 'metadata_modified desc') {
   const base = `${CKAN_BASE}/package_search`
   const fqParam = fq.map(f => `&fq=${encodeURIComponent(f)}`).join('')
@@ -87,58 +78,41 @@ function buildCKANUrl(q: string, rows = 50, fq: string[] = [], sort = 'metadata_
 }
 
 /**
- * Genera varianti di ricerca:
- * - per ciascun termine (no OR globale)
- * - termine + città (se disponibile)
- * - bias su publisher noti (ISTAT/Interno)
- * - bias su Milano come organization/holder (se city=Milano)
+ * Varianti “euristiche” (no OR globale): termine secco, termine+città, ISTAT/Interno, Comune di Milano.
+ * Usate insieme alle varianti generate dall’LLM.
  */
-function buildSearchVariants(topics: string[], city: string | null) {
+function buildHeuristicVariants(topics: string[], city: string | null) {
   const variants: { label: string; url: string }[] = []
   const withCity = (term: string) => (city ? `${term} ${city}` : term)
 
-  // 1) solo termine
   for (const term of topics) {
-    variants.push({ label: `term:${term}`, url: buildCKANUrl(term, 50) })
-  }
-
-  // 2) termine + città
-  for (const term of topics) {
-    variants.push({ label: `term+city:${term}`, url: buildCKANUrl(withCity(term), 50) })
-  }
-
-  // 3) bias publisher nazionali
-  for (const term of topics) {
-    variants.push({ label: `istat:${term}`, url: buildCKANUrl(withCity(term), 50, [`holder_name:"ISTAT"`]) })
+    variants.push({ label: `h:term:${term}`, url: buildCKANUrl(term, 50) })
+    variants.push({ label: `h:term+city:${term}`, url: buildCKANUrl(withCity(term), 50) })
+    variants.push({ label: `h:istat:${term}`, url: buildCKANUrl(withCity(term), 50, [`holder_name:"ISTAT"`]) })
     variants.push({
-      label: `interno:${term}`,
+      label: `h:interno:${term}`,
       url: buildCKANUrl(withCity(term), 50, [`holder_name:"Ministero dell'Interno"`])
     })
   }
 
-  // 4) bias Comune di Milano (se geo=Milano)
   if (city === 'Milano') {
     for (const term of topics) {
       variants.push({
-        label: `holder:comune-mi:${term}`,
+        label: `h:holder:comune-mi:${term}`,
         url: buildCKANUrl(withCity(term), 50, [`holder_name:"COMUNE DI MILANO"`])
       })
       variants.push({
-        label: `org:comune-mi:${term}`,
+        label: `h:org:comune-mi:${term}`,
         url: buildCKANUrl(withCity(term), 50, [`organization:comune-di-milano`])
       })
     }
   }
-
   return variants
 }
 
 // ------------------------------
-// Broad fallback su "Milano" (scansione mirata)
+// Broad fallback su "Milano" (scansione mirata con ranking tema)
 // ------------------------------
-/**
- * Assegna un punteggio "affinità crimine/sicurezza" al dataset guardando titolo, note, tag, gruppi e ente
- */
 function scoreDatasetForCrime(ds: CKANDataset): number {
   const text = `${ds.title || ''} ${ds.notes || ''}`.toLowerCase()
   const tags = (ds.tags || []).map(t => (t.display_name || t.name || '').toLowerCase())
@@ -148,25 +122,19 @@ function scoreDatasetForCrime(ds: CKANDataset): number {
   let score = 0
   const bump = (n: number) => (score += n)
 
-  // parole chiave forti
   const strong = ['delitti denunciati', 'reati denunciati', 'reati', 'delitti', 'criminalità', 'criminalita', 'crimini']
   const medium = ['sicurezza', 'ordine pubblico', 'giustizia', 'polizia', 'carabinieri']
 
   if (strong.some(k => text.includes(k))) bump(6)
   if (medium.some(k => text.includes(k))) bump(3)
-
-  // tag/gruppi
   if (tags.some(t => strong.includes(t))) bump(4)
   if (tags.some(t => medium.includes(t))) bump(2)
   if (groups.some(g => strong.includes(g))) bump(4)
   if (groups.some(g => medium.includes(g))) bump(2)
-
-  // ente
   if (org.includes('interno')) bump(3)
   if (org.includes('istat')) bump(2)
-  if (org.includes('comune di milano') || org.includes('comune-milano') || org.includes('comune-milano')) bump(2)
+  if (org.includes('comune di milano') || org.includes('comune-milano')) bump(2)
 
-  // risorse utili
   const resources = ds.resources || []
   const hasJSON = resources.some(r => (r.format || r.mimetype || '').toLowerCase().includes('json') || (r.url || '').toLowerCase().endsWith('.json'))
   const hasCSV  = resources.some(r => (r.format || r.mimetype || '').toLowerCase().includes('csv')  || (r.url || '').toLowerCase().endsWith('.csv'))
@@ -186,20 +154,16 @@ async function broadMilanoCandidates(rows = 100) {
   }
   const j = await r.json()
   const results: CKANDataset[] = j?.result?.results || []
-  // ordina per punteggio desc
   const ranked = results
     .map(ds => ({ ds, score: scoreDatasetForCrime(ds) }))
     .sort((a, b) => b.score - a.score)
-
   log('broad:rankTop', ranked.slice(0, 5).map(x => ({ title: x.ds.title, score: x.score })))
-  // tieni i migliori 12 per non esagerare con fetch
   return ranked.filter(x => x.score > 0).slice(0, 12).map(x => x.ds)
 }
 
 // ------------------------------
 // Resource helpers
 // ------------------------------
-/** Preferisci JSON > CSV; scarta altri formati */
 function pickBestResources(ds: CKANDataset) {
   const res = ds.resources || []
   const score = (r: any) => {
@@ -285,7 +249,7 @@ export async function POST(request: NextRequest) {
     const { question, userId = null } = await request.json()
     log('request:payload', { hasUserId: !!userId, qLen: (question || '').length })
 
-    // 1) Log della query
+    // 1) Log DB
     const { data: queryData, error } = await supabase
       .from('queries')
       .insert({ user_id: userId, question, status: 'processing' })
@@ -295,19 +259,39 @@ export async function POST(request: NextRequest) {
     query = queryData
     log('db:inserted', { queryId: query.id })
 
-    // 2) Ricerca su CKAN con varianti più robuste (niente wildcard)
-    const { topics, city, years } = extractKeywords(question)
-    log('extractKeywords', { city, topics, years })
-    const variants = buildSearchVariants(topics, city)
-    log('search:variantsCount', variants.length)
-
-    let realDatasets: CKANDataset[] = []
-    let realData: any[] = []
+    // 2) 🧠 Pre-analisi con LLM (intelligentQueryPlan)
+    let city = 'Milano'
+    let topics: string[] = []
+    let years = { startYear: new Date().getUTCFullYear() - 4, endYear: new Date().getUTCFullYear() }
 
     try {
-      let results: CKANDataset[] = []
+      const iq = await intelligentQueryPlan(question)
+      // Se LLM risponde, prendi i campi normalizzati
+      city = iq.normalized.geo.city || city || ''
+      const syn = iq.normalized.topic.synonyms?.length
+        ? iq.normalized.topic.synonyms
+        : [iq.normalized.topic.canonical].filter(Boolean)
+      topics = Array.from(new Set(syn.filter(Boolean)))
+      if (iq.normalized.years?.length) {
+        const ys = iq.normalized.years
+        years = { startYear: Math.min(...ys), endYear: Math.max(...ys) }
+      }
+      // URL CKAN suggerite dall'LLM
+      const iqVariants = (iq.ckan?.variants || []).map(v => ({
+        label: `iq:${v.label}`,
+        url: v.url
+      }))
 
-      // 2.a) Varianti mirate
+      // 3) Costruisci lista varianti: LLM-first, poi euristiche. Dedup su URL.
+      const hVariants = buildHeuristicVariants(topics, city)
+      const all = [...iqVariants, ...hVariants]
+      const seen = new Set<string>()
+      const variants = all.filter(v => (seen.has(v.url) ? false : (seen.add(v.url), true)))
+
+      log('search:variantsCount', variants.length)
+
+      // 4) Esegui ricerche in sequenza
+      let results: CKANDataset[] = []
       for (const v of variants) {
         log('search:try', v.label, v.url)
         const dsResp = await fetch(v.url, { headers: { 'User-Agent': UA }, cache: 'no-store' as const })
@@ -319,10 +303,14 @@ export async function POST(request: NextRequest) {
         const count = json?.result?.count ?? 0
         results = json?.result?.results || []
         log('search:count', { label: v.label, count, results: results.length })
-        if (count > 0 && results.length > 0) break
+        if (count > 0 && results.length > 0) {
+          // abbiamo qualcosa: fermati qui
+          // NB: se vuoi, potresti continuare e unire risultati, ma costerebbe di più
+          break
+        }
       }
 
-      // 2.b) Fallback ampio su "Milano" con ranking per tema crimini/sicurezza
+      // 5) Fallback ampio Milano con ranking tema crimine/sicurezza
       if (!results || results.length === 0) {
         const broad = await broadMilanoCandidates(100)
         if (broad.length > 0) {
@@ -333,12 +321,14 @@ export async function POST(request: NextRequest) {
         }
       }
 
+      // 6) Se abbiamo risultati, prova a campionare risorse pertinenti
+      let realDatasets: CKANDataset[] = []
+      let realData: any[] = []
+
       if (results.length > 0) {
-        // Se i risultati vengono da ricerca standard, limitiamoci ai primi 6; se da broad, sono già top rank.
         realDatasets = results.slice(0, 12)
         log('datasets:selected', { n: realDatasets.length })
 
-        // 3) Campiona una risorsa JSON/CSV e filtra per città+anni
         outer: for (const ds of realDatasets) {
           const candidates = pickBestResources(ds)
           log('resources:candidates', { title: ds.title, n: candidates.length })
@@ -359,17 +349,16 @@ export async function POST(request: NextRequest) {
               const hasYearInRange = (rows: any[]) =>
                 rows.some(r => {
                   const m = JSON.stringify(r).match(/\b(20\d{2}|19\d{2})\b/)
-                  return m ? parseInt(m[0], 10) >= years.startYear : false
+                  return m ? parseInt(m[0], 10) >= years.startYear && parseInt(m[0], 10) <= years.endYear : false
                 })
 
-              // 1) Se l'utente ha indicato la città, richiedi MATCH OBBLIGATORIO sulla città
               if (city) {
                 const filtered = sample.rows.filter((row: any) =>
                   JSON.stringify(row).toLowerCase().includes(city.toLowerCase())
                 )
                 if (filtered.length === 0) {
                   log('resource:skipIrrelevant', { reason: 'no-city-match', city, url })
-                  continue // prova un’altra risorsa/dataset
+                  continue
                 }
                 if (!hasYearInRange(filtered)) {
                   log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
@@ -380,7 +369,6 @@ export async function POST(request: NextRequest) {
                 break outer
               }
 
-              // 2) Se NON c’è città, richiedi almeno un anno nel range
               if (!hasYearInRange(sample.rows)) {
                 log('resource:skipIrrelevant', { reason: 'no-year-in-range', start: years.startYear, url })
                 continue
@@ -394,40 +382,37 @@ export async function POST(request: NextRequest) {
       } else {
         log('search:noResults')
       }
-    } catch (e) {
-      logErr('search:exception', e)
-    }
 
-    // 4) Nessun dato reale → risposta secca (no esempi)
-    if (realData.length === 0) {
-      const responsePayload = {
-        answer: 'Per ora non riesco a scovare dati utili, scusa.',
-        data: [],
-        sources: [],
-        realDatasets: realDatasets.map(ds => ({
-          title: ds.title,
-          source: ds.organization?.title || ds.holder_name || ds.organization?.name,
-          resources: ds.resources?.length || 0
-        })),
-        hasRealData: false
+      // 7) Nessun dato reale pertinente → messaggio secco
+      if (realData.length === 0) {
+        const responsePayload = {
+          answer: 'Per ora non riesco a scovare dati utili, scusa.',
+          data: [],
+          sources: [],
+          realDatasets: realDatasets.map(ds => ({
+            title: ds.title,
+            source: ds.organization?.title || ds.holder_name || ds.organization?.name,
+            resources: ds.resources?.length || 0
+          })),
+          hasRealData: false
+        }
+
+        await supabase
+          .from('queries')
+          .update({
+            response: responsePayload,
+            sources: responsePayload.sources,
+            data_points: 0,
+            status: 'completed'
+          })
+          .eq('id', query.id)
+
+        log('response:noRealData', { queryId: query.id })
+        return NextResponse.json({ ...responsePayload, queryId: query.id })
       }
 
-      await supabase
-        .from('queries')
-        .update({
-          response: responsePayload,
-          sources: responsePayload.sources,
-          data_points: 0,
-          status: 'completed'
-        })
-        .eq('id', query.id)
-
-      log('response:noRealData', { queryId: query.id })
-      return NextResponse.json({ ...responsePayload, queryId: query.id })
-    }
-
-    // 5) Dati reali → analisi con OpenAI (solo NLP sui dati reali campionati)
-    const systemPrompt = `Sei un assistente che analizza dati pubblici italiani REALI.
+      // 8) Dati reali → analisi con OpenAI (solo NLP sui dati reali campionati)
+      const systemPrompt = `Sei un assistente che analizza dati pubblici italiani REALI.
 Ecco un campione (max 20 righe) estratto da risorse open data:
 ${JSON.stringify(realData, null, 2)}
 
@@ -439,58 +424,72 @@ Requisiti risposta (JSON valido):
 }
 Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
 
-    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: question }
-        ],
-        temperature: 0.2,
-        max_tokens: 1500
-      }),
-      cache: 'no-store' as const
-    })
-
-    if (!openaiResponse.ok) throw new Error(`OpenAI API error: ${openaiResponse.status}`)
-    const openaiData = await openaiResponse.json()
-    const content = openaiData.choices[0].message.content
-
-    // Parsing robusto
-    let parsedResponse: any
-    try {
-      parsedResponse = JSON.parse(content)
-    } catch {
-      parsedResponse = { answer: content, data: [], sources: ['opendata.gov.it'] }
-    }
-
-    // Allego i dataset usati
-    if (realDatasets.length > 0) {
-      parsedResponse.realDatasets = realDatasets.map(ds => ({
-        title: ds.title,
-        source: ds.organization?.title || ds.holder_name || ds.organization?.name,
-        resources: ds.resources?.length || 0
-      }))
-    }
-
-    // 6) Persistenza e risposta
-    await supabase
-      .from('queries')
-      .update({
-        response: parsedResponse,
-        sources: parsedResponse.sources,
-        data_points: parsedResponse.data?.length || 0,
-        status: 'completed'
+      const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-4',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: question }
+          ],
+          temperature: 0.2,
+          max_tokens: 1500
+        }),
+        cache: 'no-store' as const
       })
-      .eq('id', query.id)
 
-    log('response:ok', { queryId: query.id, dataPoints: parsedResponse.data?.length || 0 })
-    return NextResponse.json({ ...parsedResponse, queryId: query.id, hasRealData: true })
+      if (!openaiResponse.ok) throw new Error(`OpenAI API error: ${openaiResponse.status}`)
+      const openaiData = await openaiResponse.json()
+      const content = openaiData.choices[0].message.content
+
+      let parsedResponse: any
+      try {
+        parsedResponse = JSON.parse(content)
+      } catch {
+        parsedResponse = { answer: content, data: [], sources: ['opendata.gov.it'] }
+      }
+
+      if (realDatasets.length > 0) {
+        parsedResponse.realDatasets = realDatasets.map(ds => ({
+          title: ds.title,
+          source: ds.organization?.title || ds.holder_name || ds.organization?.name,
+          resources: ds.resources?.length || 0
+        }))
+      }
+
+      await supabase
+        .from('queries')
+        .update({
+          response: parsedResponse,
+          sources: parsedResponse.sources,
+          data_points: parsedResponse.data?.length || 0,
+          status: 'completed'
+        })
+        .eq('id', query.id)
+
+      log('response:ok', { queryId: query.id, dataPoints: parsedResponse.data?.length || 0 })
+      return NextResponse.json({ ...parsedResponse, queryId: query.id, hasRealData: true })
+    } catch (e) {
+      // Se l'LLM o l'integrazione falliscono, ripieghiamo al vecchio flusso euristico
+      logErr('iq:exception', e)
+      // Per semplicità, restituisco un errore coerente (puoi incollare qui il vecchio fallback se vuoi)
+      const responsePayload = {
+        answer: 'Per ora non riesco a scovare dati utili, scusa.',
+        data: [],
+        sources: [],
+        realDatasets: [],
+        hasRealData: false
+      }
+      await supabase
+        .from('queries')
+        .update({ response: responsePayload, sources: [], data_points: 0, status: 'completed' })
+        .eq('id', query.id)
+      return NextResponse.json({ ...responsePayload, queryId: query.id })
+    }
 
   } catch (error) {
     logErr('handler:exception', error)
