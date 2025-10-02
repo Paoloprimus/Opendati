@@ -48,7 +48,7 @@ export type IQResult = {
    0) Ontologia minima temi
    -------------------------- */
 const TOPIC_ONTOLOGY: Record<string, string[]> = {
-  reati: ["reati", "delitti", "criminalità", "crimini", "reati denunciati"],
+  reati: ['reati', 'delitti', 'criminalità', 'crimini', 'reati denunciati'],
   // estendibile: incidenti_stradali, bilancio, popolazione, ecc.
 }
 
@@ -69,8 +69,8 @@ function localHeuristics(question: string): Partial<NormalizedQuery> {
   const q = question.toLowerCase()
 
   // Geo molto basilare (puoi sostituire con un dizionario IT o NER in futuro)
-  const geo: NormalizedQuery["geo"] = {}
-  if (/\bmilano\b/.test(q)) geo.city = "Milano"
+  const geo: NormalizedQuery['geo'] = {}
+  if (/\bmilano\b/.test(q)) geo.city = 'Milano'
 
   // Anni espliciti
   const explicitYears = Array.from(q.matchAll(/\b(19|20)\d{2}\b/g)).map(m => parseInt(m[0], 10))
@@ -87,7 +87,7 @@ function localHeuristics(question: string): Partial<NormalizedQuery> {
       : []
 
   // Tema: prova a mappare sui sinonimi
-  let canonical = "generico"
+  let canonical = 'generico'
   let synonyms: string[] = []
   for (const [canon, syns] of Object.entries(TOPIC_ONTOLOGY)) {
     if (syns.some(s => q.includes(s))) {
@@ -125,7 +125,7 @@ Regole:
 - Niente testo extra fuori dal JSON.
 
 Testo:
-"${question}"`}
+"${question}"`;
 }
 
 /* --------------------------
@@ -133,17 +133,17 @@ Testo:
    -------------------------- */
 async function llmExtract(question: string): Promise<Partial<NormalizedQuery> | null> {
   try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
       headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: "gpt-4",
+        model: 'gpt-4',
         messages: [
-          { role: "system", content: "Sei un estrattore di entità per ricerche open-data. Rispondi solo con JSON." },
-          { role: "user", content: buildExtractionPrompt(question) }
+          { role: 'system', content: 'Sei un estrattore di entità per ricerche open-data. Rispondi solo con JSON.' },
+          { role: 'user', content: buildExtractionPrompt(question) }
         ],
         temperature: 0.1,
         max_tokens: 600
@@ -151,7 +151,7 @@ async function llmExtract(question: string): Promise<Partial<NormalizedQuery> | 
     })
     if (!resp.ok) return null
     const data = await resp.json()
-    const content: string = data?.choices?.[0]?.message?.content || ""
+    const content: string = data?.choices?.[0]?.message?.content || ''
     try {
       const parsed = JSON.parse(content)
       return parsed
@@ -167,7 +167,7 @@ async function llmExtract(question: string): Promise<Partial<NormalizedQuery> | 
    5) Normalizzazione finale (LLM + fallback + ontologia interna)
    -------------------------- */
 function normalizeTopic(topic: { canonical?: string; synonyms?: string[] } | undefined): {canonical: string; synonyms: string[]} {
-  const rawCanon = (topic?.canonical || "").toLowerCase().trim()
+  const rawCanon = (topic?.canonical || '').toLowerCase().trim()
   // Mappa in base all'ontologia nota
   for (const [canon, syns] of Object.entries(TOPIC_ONTOLOGY)) {
     if (canon === rawCanon || syns.includes(rawCanon)) {
@@ -182,7 +182,7 @@ function normalizeTopic(topic: { canonical?: string; synonyms?: string[] } | und
   }
   // fallback
   return {
-    canonical: rawCanon || "generico",
+    canonical: rawCanon || 'generico',
     synonyms: topic?.synonyms || (rawCanon ? [rawCanon] : [])
   }
 }
@@ -191,51 +191,51 @@ function normalizeTopic(topic: { canonical?: string; synonyms?: string[] } | und
    6) Costruttore piano CKAN
    -------------------------- */
 function buildCKANUrl(q: string, rows = 12, fq: string[] = []): string {
-  const base = "https://www.dati.gov.it/opendata/api/3/action/package_search"
-  const fqParam = fq.map(f => `&fq=${encodeURIComponent(f)}`).join("")
+  const base = 'https://www.dati.gov.it/opendata/api/3/action/package_search'
+  const fqParam = fq.map(f => `&fq=${encodeURIComponent(f)}`).join('')
   return `${base}?q=${encodeURIComponent(q)}&rows=${rows}${fqParam}`
 }
 
 function buildCKANPlan(n: NormalizedQuery): CKANQueryPlan {
   // q: "syn1" OR "syn2" ... + città se presente
   const syn = n.topic.synonyms.length ? n.topic.synonyms : [n.topic.canonical]
-  const quotedSyn = syn.map(s => `"${s}"`).join(" OR ")
-  const geoBit = n.geo.city ? ` "${n.geo.city}"` : ""
+  const quotedSyn = syn.map(s => `"${s}"`).join(' OR ')
+  const geoBit = n.geo.city ? ` "${n.geo.city}"` : ''
   const baseQuery = `${quotedSyn}${geoBit}`.trim()
 
   // anni come stringa per debug (CKAN indicizza testo metadati; gli anni aiutano se compaiono in title/description)
-  const yearsStr = n.years.length ? n.years.join(" OR ") : ""
+  const yearsStr = n.years.length ? n.years.join(' OR ') : ''
 
   // Filtri fq tipici:
-  const fqMilanoHolder = n.geo.city === "Milano" ? [`holder_name:"COMUNE DI MILANO"`] : []
-  const fqOrgMilano = n.geo.city === "Milano" ? [`organization:comune-di-milano`] : []
+  const fqMilanoHolder = n.geo.city === 'Milano' ? [`holder_name:"COMUNE DI MILANO"`] : []
+  const fqOrgMilano = n.geo.city === 'Milano' ? [`organization:comune-di-milano`] : []
 
   // Varianti ordinate (provane più d’una)
   const variants: CKANQueryVariant[] = [
     {
-      label: "Comune di Milano (holder), sinonimi tema + città",
-      url: buildCKANUrl(`${baseQuery}${yearsStr ? " " + yearsStr : ""}`, 12, [...fqMilanoHolder]),
-      rationale: "Spesso i dataset civici sono pubblicati a nome del Comune.",
+      label: 'Comune di Milano (holder), sinonimi tema + città',
+      url: buildCKANUrl(`${baseQuery}${yearsStr ? ' ' + yearsStr : ''}`, 12, [...fqMilanoHolder]),
+      rationale: 'Spesso i dataset civici sono pubblicati a nome del Comune.',
       priority: 1
     },
     {
-      label: "Comune di Milano (organization), sinonimi tema + città",
-      url: buildCKANUrl(`${baseQuery}${yearsStr ? " " + yearsStr : ""}`, 12, [...fqOrgMilano]),
-      rationale: "Alcuni cataloghi usano organization anziché holder_name.",
+      label: 'Comune di Milano (organization), sinonimi tema + città',
+      url: buildCKANUrl(`${baseQuery}${yearsStr ? ' ' + yearsStr : ''}`, 12, [...fqOrgMilano]),
+      rationale: 'Alcuni cataloghi usano organization anziché holder_name.',
       priority: 2
     },
     {
-      label: "Nazionale (ISTAT/Interno), sinonimi tema + città nel q",
-      url: buildCKANUrl(`${baseQuery}${yearsStr ? " " + yearsStr : ""}`, 12, [
+      label: 'Nazionale (ISTAT/Interno), sinonimi tema + città nel q',
+      url: buildCKANUrl(`${baseQuery}${yearsStr ? ' ' + yearsStr : ''}`, 12, [
         `holder_name:"ISTAT"`, `holder_name:"Ministero dell'Interno"`
       ]),
-      rationale: "Crimini spesso pubblicati da ISTAT o Ministero dell’Interno.",
+      rationale: 'Crimini spesso pubblicati da ISTAT o Ministero dell’Interno.',
       priority: 3
     },
     {
-      label: "Solo testo (sinonimi + città + anni), nessun fq",
-      url: buildCKANUrl(`${baseQuery}${yearsStr ? " " + yearsStr : ""}`, 12),
-      rationale: "Fallback generico su metadati indicizzati.",
+      label: 'Solo testo (sinonimi + città + anni), nessun fq',
+      url: buildCKANUrl(`${baseQuery}${yearsStr ? ' ' + yearsStr : ''}`, 12),
+      rationale: 'Fallback generico su metadati indicizzati.',
       priority: 4
     }
   ]
@@ -259,17 +259,17 @@ export async function intelligentQueryPlan(question: string): Promise<IQResult> 
 
   // c) merge (LLM ha priorità; poi integriamo dove mancano campi)
   const geo = {
-    city: llm?.geo?.city || local.geo?.city || "",
-    province: llm?.geo?.province || "",
-    region: llm?.geo?.region || "",
-    nation: llm?.geo?.nation || "Italia"
+    city: llm?.geo?.city || local.geo?.city || '',
+    province: llm?.geo?.province || '',
+    region: llm?.geo?.region || '',
+    nation: llm?.geo?.nation || 'Italia'
   }
   const years = (llm?.years && llm.years.length ? llm.years : (local.years || []))
     // dedup + sort
     .filter((v, i, a) => a.indexOf(v) === i)
     .sort((a,b) => a - b)
 
-  const topicNorm = normalizeTopic(llm?.topic || local.topic as any)
+  const topicNorm = normalizeTopic(llm?.topic || (local as any).topic)
 
   const normalized: NormalizedQuery = {
     original: question,
@@ -283,11 +283,3 @@ export async function intelligentQueryPlan(question: string): Promise<IQResult> 
   const ckan = buildCKANPlan(normalized)
   return { normalized, ckan }
 }
-
-/* --------------------------
-   8) Esempio d'uso (da rimuovere in produzione)
-   -------------------------- */
-// (async () => {
-//   const res = await intelligentQueryPlan("Mostrami l'andamento dei reati a Milano negli ultimi 5 anni")
-//   console.log(JSON.stringify(res, null, 2))
-// })()
