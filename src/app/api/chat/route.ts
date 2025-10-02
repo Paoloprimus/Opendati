@@ -2,6 +2,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 
+export const runtime = 'nodejs' // usa Node runtime (Buffer, fetch HEAD, ecc.)
+
 type CKANDataset = {
   title: string
   organization?: { title?: string }
@@ -14,7 +16,7 @@ type CKANDataset = {
   }>
 }
 
-const UA = 'Opendati.it/1.2'
+const UA = 'Opendati.it/1.1'
 
 // ------------------------------
 //  Helpers: estrazione keyword
@@ -37,42 +39,33 @@ function extractKeywords(question: string) {
   }
 }
 
-// Costruisce URL CKAN con filtri opzionali (fq)
+// Costruisce URL CKAN con faceted query opzionali (fq)
 function buildCKANUrl(q: string, rows = 12, fq: string[] = []) {
   const base = 'https://www.dati.gov.it/opendata/api/3/action/package_search'
   const fqParam = fq.map(f => `&fq=${encodeURIComponent(f)}`).join('')
   return `${base}?q=${encodeURIComponent(q)}&rows=${rows}${fqParam}`
 }
 
-// Genera un set di URL da provare (Comune di Milano, ISTAT/Interno, fallback)
+// Genera varianti di ricerca: Comune di Milano, ISTAT, Interno, fallback testo
 function buildSearchUrls(ckanQ: string, city: string | null) {
   const urls: string[] = []
   if (city === 'Milano') {
     urls.push(buildCKANUrl(ckanQ, 12, ['holder_name:"COMUNE DI MILANO"']))
     urls.push(buildCKANUrl(ckanQ, 12, ['organization:comune-di-milano']))
   }
-  // Nazionale (reati): ISTAT o Ministero dell'Interno
   urls.push(buildCKANUrl(ckanQ, 12, ['holder_name:"ISTAT"']))
   urls.push(buildCKANUrl(ckanQ, 12, ['holder_name:"Ministero dell\'Interno"']))
-  // Fallback solo testo
-  urls.push(buildCKANUrl(ckanQ, 12))
+  urls.push(buildCKANUrl(ckanQ, 12)) // fallback
   return urls
 }
 
-// Preferisci risorse JSON > CSV > XLS/XLSX; scarta il resto
+// Preferisci risorse JSON > CSV; scarta altri formati
 function pickBestResources(ds: CKANDataset) {
   const res = ds.resources || []
   const score = (r: any) => {
-    const fmtSrc = (r.format || r.mimetype || '').toString().toLowerCase()
-    const url = (r.url || '').toLowerCase()
-    const fmt =
-      fmtSrc ||
-      (url.endsWith('.json') ? 'json' :
-       url.endsWith('.csv') ? 'csv' :
-       url.endsWith('.xlsx') || url.endsWith('.xls') ? 'xlsx' : '')
+    const fmt = (r.format || r.mimetype || '').toString().toLowerCase()
     if (fmt.includes('json') || fmt === 'json') return 3
-    if (fmt.includes('csv') || fmt === 'csv') return 2
-    if (fmt.includes('xls')) return 2
+    if (fmt.includes('csv') || fmt === 'csv' || r.url?.toLowerCase().endsWith('.csv')) return 2
     return 0
   }
   return res
@@ -103,8 +96,8 @@ function splitCSVLine(line: string, headerLine: string) {
   return line.split(delim)
 }
 
-// Scarica un campione JSON/CSV/XLSX (limite 1 MB)
-async function fetchSampleData(url: string, expect: 'json'|'csv'|'xlsx', maxBytes = 1_000_000) {
+// Scarica un campione JSON/CSV (limite 1 MB)
+async function fetchSampleData(url: string, expect: 'json'|'csv', maxBytes = 1_000_000) {
   const h = await headInfo(url)
   if (h.ok && h.contentLength && h.contentLength > maxBytes) {
     return { rows: [], note: 'skipped_large_file' }
@@ -114,10 +107,10 @@ async function fetchSampleData(url: string, expect: 'json'|'csv'|'xlsx', maxByte
 
   const buf = Buffer.from(await resp.arrayBuffer())
   const slice = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf
+  const text = slice.toString('utf-8')
 
   if (expect === 'json') {
     try {
-      const text = slice.toString('utf-8')
       const json = JSON.parse(text)
       if (Array.isArray(json)) return { rows: json.slice(0, 20), note: 'json_array_sample' }
       const arr = (json.data || json.records || json.result || [])
@@ -127,42 +120,17 @@ async function fetchSampleData(url: string, expect: 'json'|'csv'|'xlsx', maxByte
     }
   }
 
-  if (expect === 'csv') {
-    const text = slice.toString('utf-8')
-    const lines = text.split(/\r?\n/).filter(Boolean).slice(0, 101) // fino a 100 righe
-    if (lines.length < 2) return { rows: [], note: 'csv_too_short' }
-    const headers = splitCSVLine(lines[0], lines[0]).map(h => h.trim())
-    const rows = lines.slice(1).map(line => {
-      const values = splitCSVLine(line, lines[0])
-      const obj: Record<string, string> = {}
-      headers.forEach((h, i) => (obj[h || `col_${i+1}`] = (values[i] || '').trim()))
-      return obj
-    })
-    return { rows: rows.slice(0, 20), note: 'csv_sample' }
-  }
-
-  // XLS/XLSX
-  if (expect === 'xlsx') {
-    try {
-      const XLSX = await import('xlsx')
-      const wb = XLSX.read(slice, { type: 'buffer' })
-      const first = wb.SheetNames[0]
-      const sheet = wb.Sheets[first]
-      const arr = XLSX.utils.sheet_to_json<any>(sheet, { header: 1 }) as any[][]
-      if (!arr || arr.length < 2) return { rows: [], note: 'xlsx_too_short' }
-      const headers = (arr[0] || []).map((h, i) => (String(h || `col_${i+1}`)).trim())
-      const rows = arr.slice(1, 101).map(row => {
-        const obj: Record<string, string> = {}
-        headers.forEach((h, i) => (obj[h] = (row[i] ?? '').toString().trim()))
-        return obj
-      })
-      return { rows: rows.slice(0, 20), note: 'xlsx_sample' }
-    } catch {
-      return { rows: [], note: 'xlsx_parse_error' }
-    }
-  }
-
-  return { rows: [], note: 'unsupported_format' }
+  // CSV con autodetect delimitatore
+  const lines = text.split(/\r?\n/).filter(Boolean).slice(0, 101)
+  if (lines.length < 2) return { rows: [], note: 'csv_too_short' }
+  const headers = splitCSVLine(lines[0], lines[0]).map(h => h.trim())
+  const rows = lines.slice(1).map(line => {
+    const values = splitCSVLine(line, lines[0])
+    const obj: Record<string, string> = {}
+    headers.forEach((h, i) => (obj[h || `col_${i+1}`] = (values[i] || '').trim()))
+    return obj
+  })
+  return { rows: rows.slice(0, 20), note: 'csv_sample' }
 }
 
 // ------------------------------
@@ -183,7 +151,7 @@ export async function POST(request: NextRequest) {
     if (error) throw error
     query = queryData
 
-    // 2) Ricerca dataset reali su dati.gov.it (keyword migliorate + fq)
+    // 2) Ricerca dataset reali su dati.gov.it (keyword migliorate + varianti fq)
     const { ckanQ, city, years } = extractKeywords(question)
     let realDatasets: CKANDataset[] = []
     let realData: any[] = []
@@ -192,38 +160,37 @@ export async function POST(request: NextRequest) {
       const urls = buildSearchUrls(ckanQ, city)
       let results: CKANDataset[] = []
 
-      // prova varianti in sequenza finché trovi risultati
       for (const searchUrl of urls) {
         console.log('[CHAT] CKAN search URL:', searchUrl)
         const dsResp = await fetch(searchUrl, { headers: { 'User-Agent': UA } })
         if (!dsResp.ok) continue
         const json = await dsResp.json()
+        const count = json?.result?.count ?? 0
+        console.log('[CHAT] CKAN count:', count)
         results = json?.result?.results || []
-        if (results.length > 0) {
-          break
-        }
+        if (count > 0 && results.length > 0) break
       }
 
       if (results.length > 0) {
-        realDatasets = results.slice(0, 6) // espandi un po' il ventaglio
+        realDatasets = results.slice(0, 4)
 
-        // Prova più dataset/risorse finché trovi righe campionabili
+        // Prova più dataset/risorse finché trovi righe campionabili (JSON/CSV)
         outer:
         for (const ds of realDatasets) {
           const candidates = pickBestResources(ds)
           for (const r of candidates) {
             const url = r.url as string
-            const low = (r.format || r.mimetype || url).toString().toLowerCase()
-            let expect: 'json'|'csv'|'xlsx'|null = null
-            if (low.includes('json') || url.toLowerCase().endsWith('.json')) expect = 'json'
-            else if (low.includes('csv') || url.toLowerCase().endsWith('.csv')) expect = 'csv'
-            else if (low.includes('xls')) expect = 'xlsx'
+            const fmt = (r.format || r.mimetype || url).toString().toLowerCase()
 
+            const expect: 'json'|'csv' | null =
+              fmt.includes('json') || url.toLowerCase().endsWith('.json') ? 'json'
+              : (fmt.includes('csv') || url.toLowerCase().endsWith('.csv')) ? 'csv'
+              : null
             if (!expect) continue
 
             const sample = await fetchSampleData(url, expect)
             if (sample.rows && sample.rows.length) {
-              // Filtro euristico: occorrenze città + anni
+              // Filtro euristico: cerca occorrenze città + anni recenti nel record
               const filtered = sample.rows.filter((row: any) => {
                 const s = JSON.stringify(row).toLowerCase()
                 const cityOk = city ? s.includes(city.toLowerCase()) : true
