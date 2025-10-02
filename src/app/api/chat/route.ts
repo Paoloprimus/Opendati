@@ -1,15 +1,15 @@
 // src/app/api/chat/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
-import { intelligentQueryPlan } from '@/lib/query/intelligentQuery'
+import { intelligentQueryPlan } from '@/lib/query/intelligentQuery' // LLM pre-analisi query
 
 /**
- * Esegui sempre lato Node e in modo dinamico (no cache build).
+ * Esegui sempre lato Node e in modo dinamico (no cache di build).
  */
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-/** CKAN base: endpoint che nel debug ha dato risultati */
+/** CKAN base usata nei test di debug (funziona) */
 const CKAN_BASE = 'https://www.dati.gov.it/opendata/api/3/action'
 
 type CKANTag = { name?: string; display_name?: string }
@@ -30,19 +30,41 @@ type CKANDataset = {
   }>
 }
 
-const UA = 'Opendati.it/1.8'
+const UA = 'Opendati.it/2.0'
 
-// ------------------------------
+// ---------------------------------
 // Logging helpers
-// ------------------------------
+// ---------------------------------
 const log = (...a: any[]) => console.log('[CHAT]', ...a)
 const logErr = (...a: any[]) => console.error('[CHAT][ERR]', ...a)
 
-// ------------------------------
-// Keyword helpers (fallback locale, se LLM non disponibile)
-// ------------------------------
+// ---------------------------------
+// Retry helper per OpenAI (429/5xx)
+// ---------------------------------
+async function fetchWithRetry(url: string, init: RequestInit, attempts = 3, baseDelayMs = 400) {
+  let lastErr: any = null
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, init)
+      if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+        lastErr = new Error(`status ${res.status}`)
+      } else {
+        return res
+      }
+    } catch (e) {
+      lastErr = e
+    }
+    const sleep = baseDelayMs * Math.pow(2, i) + Math.floor(Math.random() * 150)
+    await new Promise(r => setTimeout(r, sleep))
+  }
+  throw lastErr
+}
+
+// ---------------------------------
+// Keyword helpers (fallback locale)
+// ---------------------------------
 function stripAccent(s: string) {
-  // Compatibile anche con target TS < ES2018
+  // Compatibile con target TS < ES2018 (niente \p{Diacritic})
   return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
 }
 
@@ -111,9 +133,9 @@ function buildHeuristicVariants(topics: string[], city: string | null) {
   return variants
 }
 
-// ------------------------------
-// Broad fallback su "Milano" (scansione mirata con ranking tema)
-// ------------------------------
+// ---------------------------------
+// Broad fallback “Milano” con ranking tema
+// ---------------------------------
 function scoreDatasetForCrime(ds: CKANDataset): number {
   const text = `${ds.title || ''} ${ds.notes || ''}`.toLowerCase()
   const tags = (ds.tags || []).map(t => (t.display_name || t.name || '').toLowerCase())
@@ -169,9 +191,9 @@ async function broadMilanoCandidates(rows = 100) {
     .map(x => x.ds)
 }
 
-// ------------------------------
+// ---------------------------------
 // Resource helpers
-// ------------------------------
+// ---------------------------------
 function pickBestResources(ds: CKANDataset) {
   const res = ds.resources || []
   const score = (r: any) => {
@@ -226,7 +248,7 @@ async function fetchSampleData(url: string, expect: 'json' | 'csv', maxBytes = 1
     try {
       const json = JSON.parse(text)
       if (Array.isArray(json)) return { rows: json.slice(0, 20), note: 'json_array_sample' }
-    const arr = json.data || json.records || json.result || []
+      const arr = json.data || json.records || json.result || []
       return { rows: Array.isArray(arr) ? arr.slice(0, 20) : [], note: 'json_obj_sample' }
     } catch {
       return { rows: [], note: 'json_parse_error' }
@@ -240,15 +262,15 @@ async function fetchSampleData(url: string, expect: 'json' | 'csv', maxBytes = 1
   const rows = lines.slice(1).map(line => {
     const values = splitCSVLine(line, lines[0])
     const obj: Record<string, string> = {}
-    headers.forEach((h, i) => (obj[h || `col_${i + 1}`] = (values[i] || '').trim()))
+    headers.forEach((h, i) => (obj[h] = (values[i] || '').trim()))
     return obj
   })
   return { rows: rows.slice(0, 20), note: 'csv_sample' }
 }
 
-// ------------------------------
+// ---------------------------------
 // Handler principale
-// ------------------------------
+// ---------------------------------
 export async function POST(request: NextRequest) {
   let query: any = null
 
@@ -272,16 +294,17 @@ export async function POST(request: NextRequest) {
     let city = fb.city
     let topics = fb.topics
     let years = fb.years
+    let plan: any = null
 
     try {
-      const iq = await intelligentQueryPlan(question)
-      city = iq?.normalized?.geo?.city || city
-      const syn = iq?.normalized?.topic?.synonyms?.length
-        ? iq.normalized.topic.synonyms
-        : [iq?.normalized?.topic?.canonical].filter(Boolean)
+      plan = await intelligentQueryPlan(question)
+      city = plan?.normalized?.geo?.city || city
+      const syn = plan?.normalized?.topic?.synonyms?.length
+        ? plan.normalized.topic.synonyms
+        : [plan?.normalized?.topic?.canonical].filter(Boolean)
       topics = Array.from(new Set([...(syn || []), ...(topics || [])].filter(Boolean)))
-      if (Array.isArray(iq?.normalized?.years) && iq.normalized.years.length) {
-        const ys = iq.normalized.years as number[]
+      if (Array.isArray(plan?.normalized?.years) && plan.normalized.years.length) {
+        const ys = plan.normalized.years as number[]
         years = { startYear: Math.min(...ys), endYear: Math.max(...ys) }
       }
     } catch (e) {
@@ -289,16 +312,8 @@ export async function POST(request: NextRequest) {
     }
 
     // 3) Varianti: prima LLM (se presenti), poi euristiche. Dedup su URL.
-    const iqVariants =
-      (await (async () => {
-        try {
-          const plan = await intelligentQueryPlan(question)
-          const vs = (plan?.ckan?.variants || []) as Array<{ label: string; url: string }>
-          return vs.map(v => ({ label: `iq:${v.label}`, url: v.url }))
-        } catch {
-          return []
-        }
-      })()) || []
+    const iqVariants: Array<{ label: string; url: string }> =
+      (plan?.ckan?.variants || []).map((v: any) => ({ label: `iq:${v.label}`, url: v.url })) ?? []
 
     const hVariants = buildHeuristicVariants(topics, city || null)
     const all = [...iqVariants, ...hVariants]
@@ -342,7 +357,7 @@ export async function POST(request: NextRequest) {
       realDatasets = results.slice(0, 12)
       log('datasets:selected', { n: realDatasets.length })
 
-      // ------ BLOCCO CAMPIONAMENTO (patch con accettazione "dataset-level Milano + anni") ------
+      // ------ BLOCCO CAMPIONAMENTO (accetta "dataset-level Milano + anni") ------
       outer: for (const ds of realDatasets) {
         const candidates = pickBestResources(ds)
         log('resources:candidates', { title: ds.title, n: candidates.length })
@@ -351,7 +366,7 @@ export async function POST(request: NextRequest) {
         const dsText = `${ds.title || ''} ${ds.notes || ''} ${ds.organization?.title || ''} ${ds.holder_name || ''} ${ds.organization?.name || ''}`.toLowerCase()
         const dsCityOk = city ? dsText.includes((city || '').toLowerCase()) : true
 
-        // se qualche resource è del dominio dati.comune.milano.it, consideralo Milano
+        // risorsa su host Comune di Milano => Milano
         const hasMilanoHost = (ds.resources || []).some(r => {
           try {
             const u = new URL(r.url || '')
@@ -361,10 +376,12 @@ export async function POST(request: NextRequest) {
           }
         })
 
-        // estrae anni dal titolo/notes (hint)
+        // hint anni dal titolo/notes
         const dsYears = Array.from(dsText.matchAll(/\b(19|20)\d{2}\b/g)).map(m => parseInt(m[0], 10))
         const dsMaxYear = dsYears.length ? Math.max(...dsYears) : null
-        const dsYearOk = dsMaxYear !== null ? (dsMaxYear >= years.startYear && dsMaxYear <= years.endYear || dsMaxYear >= years.startYear) : false
+        const dsYearOk = dsMaxYear !== null
+          ? (dsMaxYear >= years.startYear && dsMaxYear <= years.endYear) || dsMaxYear >= years.startYear
+          : false
 
         for (const r of candidates) {
           const url = r.url as string
@@ -391,7 +408,6 @@ export async function POST(request: NextRequest) {
               return y >= years.startYear && y <= years.endYear
             })
 
-          // ---- Policy di accettazione ----
           if (city) {
             // 1) preferisci righe che contengono "milano"
             const filteredCity = sample.rows.filter((row: any) =>
@@ -403,7 +419,7 @@ export async function POST(request: NextRequest) {
               break outer
             }
 
-            // 2) se il dataset è chiaramente di Milano (org/host) accetta il campione
+            // 2) se il dataset è chiaramente di Milano (org/host), accetta il campione
             //    purché il campione o l'hint dataset-level indichi anni nel range
             const cityByDataset = dsCityOk || hasMilanoHost
             if (cityByDataset && (hasYearInRange(sample.rows) || dsYearOk)) {
@@ -436,7 +452,7 @@ export async function POST(request: NextRequest) {
       log('search:noResults')
     }
 
-    // 7) Nessun dato reale pertinente → messaggio secco
+    // 7) Nessun dato reale pertinente → risposta secca
     if (realData.length === 0) {
       const responsePayload = {
         answer: 'Per ora non riesco a scovare dati utili, scusa.',
@@ -464,7 +480,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ ...responsePayload, queryId: query.id })
     }
 
-    // 8) Dati reali → analisi con OpenAI (solo NLP sui dati reali campionati)
+    // 8) Dati reali → analisi con OpenAI (retry) + fallback locale se LLM KO
     const systemPrompt = `Sei un assistente che analizza dati pubblici italiani REALI.
 Ecco un campione (max 20 righe) estratto da risorse open data:
 ${JSON.stringify(realData, null, 2)}
@@ -477,34 +493,68 @@ Requisiti risposta (JSON valido):
 }
 Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
 
-    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: question }
-        ],
-        temperature: 0.2,
-        max_tokens: 1500
-      }),
-      cache: 'no-store' as const
-    })
+    let parsedResponse: any | null = null
+    let llmOk = false
 
-    if (!openaiResponse.ok) throw new Error(`OpenAI API error: ${openaiResponse.status}`)
-    const openaiData = await openaiResponse.json()
-    const content = openaiData.choices[0].message.content
-
-    // Parsing robusto
-    let parsedResponse: any
     try {
-      parsedResponse = JSON.parse(content)
-    } catch {
-      parsedResponse = { answer: content, data: [], sources: ['opendata.gov.it'] }
+      const openaiResponse = await fetchWithRetry(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+          },
+          body: JSON.stringify({
+            model: 'gpt-4',
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: question }
+            ],
+            temperature: 0.2,
+            max_tokens: 1500
+          }),
+          cache: 'no-store'
+        },
+        3,
+        400
+      )
+
+      if (openaiResponse.ok) {
+        const openaiData = await openaiResponse.json()
+        const content = openaiData?.choices?.[0]?.message?.content ?? ''
+        try {
+          parsedResponse = JSON.parse(content)
+        } catch {
+          parsedResponse = { answer: content, data: [], sources: ['opendata.gov.it'] }
+        }
+        llmOk = true
+      } else {
+        logErr('openai:fail', openaiResponse.status)
+      }
+    } catch (e) {
+      logErr('openai:exception', e)
+    }
+
+    // Fallback locale se l'LLM non è disponibile
+    if (!llmOk || !parsedResponse) {
+      const yearsInSample = Array.from(
+        new Set(
+          realData.flatMap((row: any) => {
+            const m = JSON.stringify(row).match(/\b(19|20)\d{2}\b/g) || []
+            return m.map(Number)
+          })
+        )
+      ).sort((a, b) => a - b)
+
+      parsedResponse = {
+        answer:
+          `Ho trovato dati reali pertinenti${
+            yearsInSample.length ? ` (anni nel campione: ${yearsInSample.slice(0, 6).join(', ')}${yearsInSample.length > 6 ? '…' : ''})` : ''
+          }. L'analisi automatica non è disponibile al momento.`,
+        data: [],
+        sources: ['opendata.gov.it']
+      }
     }
 
     // Allego i dataset usati
@@ -516,7 +566,7 @@ Se mancano campi fondamentali (es. anni o comune), esplicitalo nel testo.`
       }))
     }
 
-    // 9) Persistenza e risposta
+    // 9) Persistenza e risposta finale
     await supabase
       .from('queries')
       .update({
