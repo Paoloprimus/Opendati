@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 
-export const runtime = 'nodejs' // usa Node runtime (Buffer, fetch HEAD, ecc.)
+export const runtime = 'nodejs' // necessario per Buffer/HEAD su Vercel
 
 type CKANDataset = {
   title: string
@@ -16,14 +16,23 @@ type CKANDataset = {
   }>
 }
 
-const UA = 'Opendati.it/1.1'
+const UA = 'Opendati.it/1.3'
 
 // ------------------------------
 //  Helpers: estrazione keyword
 // ------------------------------
+function stripAccent(s: string) {
+  return s.normalize('NFD').replace(/\p{Diacritic}/gu, '')
+}
+
 function extractKeywords(question: string) {
   const q = question.toLowerCase()
-  const crimeSyn = ['reati', 'delitti', 'criminalità', 'crimini', 'reati denunciati']
+  const baseSyn = ['reati', 'delitti', 'criminalità', 'crimini', 'reati denunciati']
+  // aggiungi versione senza accento
+  const syn = Array.from(new Set([
+    ...baseSyn,
+    ...baseSyn.map(s => stripAccent(s))
+  ]))
   const city = /\bmilano\b/.test(q) ? 'Milano' : null
 
   // Ultimi 5 anni: [Y-4 .. Y]
@@ -33,30 +42,52 @@ function extractKeywords(question: string) {
 
   return {
     city,
-    topics: crimeSyn,
-    years: { startYear, endYear },
-    ckanQ: `${crimeSyn.map(s => `"${s}"`).join(' OR ')}${city ? ` "${city}"` : ''}`.trim()
+    topics: syn,
+    years: { startYear, endYear }
   }
 }
 
-// Costruisce URL CKAN con faceted query opzionali (fq)
-function buildCKANUrl(q: string, rows = 12, fq: string[] = []) {
+// Costruisce URL CKAN con faceted query opzionali (fq) e sort
+function buildCKANUrl(q: string, rows = 50, fq: string[] = [], sort = 'metadata_modified desc') {
   const base = 'https://www.dati.gov.it/opendata/api/3/action/package_search'
   const fqParam = fq.map(f => `&fq=${encodeURIComponent(f)}`).join('')
-  return `${base}?q=${encodeURIComponent(q)}&rows=${rows}${fqParam}`
+  const sortParam = sort ? `&sort=${encodeURIComponent(sort)}` : ''
+  return `${base}?q=${encodeURIComponent(q)}&rows=${rows}${fqParam}${sortParam}`
 }
 
-// Genera varianti di ricerca: Comune di Milano, ISTAT, Interno, fallback testo
-function buildSearchUrls(ckanQ: string, city: string | null) {
-  const urls: string[] = []
-  if (city === 'Milano') {
-    urls.push(buildCKANUrl(ckanQ, 12, ['holder_name:"COMUNE DI MILANO"']))
-    urls.push(buildCKANUrl(ckanQ, 12, ['organization:comune-di-milano']))
-  }
-  urls.push(buildCKANUrl(ckanQ, 12, ['holder_name:"ISTAT"']))
-  urls.push(buildCKANUrl(ckanQ, 12, ['holder_name:"Ministero dell\'Interno"']))
-  urls.push(buildCKANUrl(ckanQ, 12)) // fallback
-  return urls
+// Genera varianti di ricerca: strict/loose × con/senza città × fq nazionali
+function buildSearchUrls(topics: string[], city: string | null) {
+  const multi = topics.filter(t => t.includes(' '))
+  const single = topics.filter(t => !t.includes(' '))
+
+  // STRICT: parole tra virgolette (più preciso ma rischia 0)
+  const strictQ = [
+    ...single.map(s => `"${s}"`),
+    ...multi.map(m => `"${m}"`)
+  ].join(' OR ')
+
+  // LOOSE: senza virgolette (meno preciso ma trova di più)
+  const looseQ = [
+    ...single,
+    ...multi.map(m => `"${m}"`) // le frasi le lasciamo comunque tra virgolette
+  ].join(' OR ')
+
+  const cityBitStrict = city ? ` "${city}"` : ''
+  const cityBitLoose  = city ? ` ${city}`   : ''
+
+  const qs = [
+    { label: 'strict+city', q: `${strictQ}${cityBitStrict}`, fq: [] as string[] },
+    { label: 'loose+city',  q: `${looseQ}${cityBitLoose}`,   fq: [] as string[] },
+    { label: 'strict',      q: `${strictQ}`,                 fq: [] as string[] },
+    { label: 'loose',       q: `${looseQ}`,                  fq: [] as string[] },
+    { label: 'loose+ISTAT', q: `${looseQ}${cityBitLoose}`,   fq: [`holder_name:"ISTAT"`] },
+    { label: 'loose+Interno', q: `${looseQ}${cityBitLoose}`, fq: [`holder_name:"Ministero dell'Interno"`] },
+  ]
+
+  return qs.map(v => ({
+    label: v.label,
+    url: buildCKANUrl(v.q, 50, v.fq),
+  }))
 }
 
 // Preferisci risorse JSON > CSV; scarta altri formati
@@ -151,28 +182,28 @@ export async function POST(request: NextRequest) {
     if (error) throw error
     query = queryData
 
-    // 2) Ricerca dataset reali su dati.gov.it (keyword migliorate + varianti fq)
-    const { ckanQ, city, years } = extractKeywords(question)
+    // 2) Ricerca dataset reali su dati.gov.it (keyword migliorate + varianti)
+    const { topics, city, years } = extractKeywords(question)
     let realDatasets: CKANDataset[] = []
     let realData: any[] = []
 
     try {
-      const urls = buildSearchUrls(ckanQ, city)
+      const variants = buildSearchUrls(topics, city)
       let results: CKANDataset[] = []
 
-      for (const searchUrl of urls) {
-        console.log('[CHAT] CKAN search URL:', searchUrl)
-        const dsResp = await fetch(searchUrl, { headers: { 'User-Agent': UA } })
+      for (const v of variants) {
+        console.log('[CHAT] CKAN search URL:', v.url)
+        const dsResp = await fetch(v.url, { headers: { 'User-Agent': UA } })
         if (!dsResp.ok) continue
         const json = await dsResp.json()
         const count = json?.result?.count ?? 0
-        console.log('[CHAT] CKAN count:', count)
+        console.log('[CHAT] CKAN count:', count, 'label:', v.label)
         results = json?.result?.results || []
         if (count > 0 && results.length > 0) break
       }
 
       if (results.length > 0) {
-        realDatasets = results.slice(0, 4)
+        realDatasets = results.slice(0, 6) // allarga un po' il ventaglio
 
         // Prova più dataset/risorse finché trovi righe campionabili (JSON/CSV)
         outer:
@@ -190,7 +221,7 @@ export async function POST(request: NextRequest) {
 
             const sample = await fetchSampleData(url, expect)
             if (sample.rows && sample.rows.length) {
-              // Filtro euristico: cerca occorrenze città + anni recenti nel record
+              // Filtro euristico: città + anni recenti
               const filtered = sample.rows.filter((row: any) => {
                 const s = JSON.stringify(row).toLowerCase()
                 const cityOk = city ? s.includes(city.toLowerCase()) : true
