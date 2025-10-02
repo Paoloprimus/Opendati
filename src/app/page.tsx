@@ -14,9 +14,6 @@ export default function Home() {
           
           <div className="max-w-2xl mx-auto">
             <div className="bg-white rounded-lg shadow-lg p-8">
-              <p className="text-gray-500 mb-4">
-                Chiedimi qualsiasi cosa sui dati italiani, se esistono te li trovo.
-              </p>
               
               <ChatInput />
               
