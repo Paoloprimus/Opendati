@@ -9,7 +9,7 @@ export default function Home() {
             Opendati.it
           </h1>
           <p className="text-xl text-gray-600 mb-8">
-            I Dati a Nostra Disposizione
+            i dati a nostra disposizione
           </p>
           
           <div className="max-w-2xl mx-auto">
