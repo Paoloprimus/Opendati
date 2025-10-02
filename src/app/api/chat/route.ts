@@ -21,15 +21,16 @@ const UA = 'Opendati.it/1.3'
 // ------------------------------
 //  Helpers: estrazione keyword
 // ------------------------------
+// Rimuove gli accenti in modo compatibile (senza \p{Diacritic})
 function stripAccent(s: string) {
-  return s.normalize('NFD').replace(/\p{Diacritic}/gu, '')
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
 }
 
 function extractKeywords(question: string) {
   const q = question.toLowerCase()
   const baseSyn = ['reati', 'delitti', 'criminalità', 'crimini', 'reati denunciati']
   // aggiungi versione senza accento
-  const syn = Array.from(new Set([
+  const topics = Array.from(new Set([
     ...baseSyn,
     ...baseSyn.map(s => stripAccent(s))
   ]))
@@ -42,7 +43,7 @@ function extractKeywords(question: string) {
 
   return {
     city,
-    topics: syn,
+    topics,
     years: { startYear, endYear }
   }
 }
@@ -66,22 +67,22 @@ function buildSearchUrls(topics: string[], city: string | null) {
     ...multi.map(m => `"${m}"`)
   ].join(' OR ')
 
-  // LOOSE: senza virgolette (meno preciso ma trova di più)
+  // LOOSE: senza virgolette per le singole (frasi restano quotate)
   const looseQ = [
     ...single,
-    ...multi.map(m => `"${m}"`) // le frasi le lasciamo comunque tra virgolette
+    ...multi.map(m => `"${m}"`)
   ].join(' OR ')
 
   const cityBitStrict = city ? ` "${city}"` : ''
   const cityBitLoose  = city ? ` ${city}`   : ''
 
   const qs = [
-    { label: 'strict+city', q: `${strictQ}${cityBitStrict}`, fq: [] as string[] },
-    { label: 'loose+city',  q: `${looseQ}${cityBitLoose}`,   fq: [] as string[] },
-    { label: 'strict',      q: `${strictQ}`,                 fq: [] as string[] },
-    { label: 'loose',       q: `${looseQ}`,                  fq: [] as string[] },
-    { label: 'loose+ISTAT', q: `${looseQ}${cityBitLoose}`,   fq: [`holder_name:"ISTAT"`] },
-    { label: 'loose+Interno', q: `${looseQ}${cityBitLoose}`, fq: [`holder_name:"Ministero dell'Interno"`] },
+    { label: 'strict+city',   q: `${strictQ}${cityBitStrict}`, fq: [] as string[] },
+    { label: 'loose+city',    q: `${looseQ}${cityBitLoose}`,   fq: [] as string[] },
+    { label: 'strict',        q: `${strictQ}`,                 fq: [] as string[] },
+    { label: 'loose',         q: `${looseQ}`,                  fq: [] as string[] },
+    { label: 'loose+ISTAT',   q: `${looseQ}${cityBitLoose}`,   fq: [`holder_name:"ISTAT"`] },
+    { label: 'loose+Interno', q: `${looseQ}${cityBitLoose}`,   fq: [`holder_name:"Ministero dell'Interno"`] },
   ]
 
   return qs.map(v => ({
